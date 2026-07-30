@@ -14,7 +14,7 @@ import sys
 import threading
 from pathlib import Path
 from tkinter import (
-    Tk, Frame, Label, Button, Entry, Scale, Checkbutton,
+    Tk, Frame, Label, Button, Entry, Scale, Checkbutton, Canvas,
     filedialog, messagebox, StringVar, IntVar, DoubleVar, BooleanVar,
     HORIZONTAL, Text, Scrollbar
 )
@@ -33,7 +33,8 @@ class DesignAutoGUI:
     def __init__(self, root: Tk):
         self.root = root
         self.root.title("异形设计自动化工具 v2.0")
-        self.root.geometry("920x800")
+        self.root.geometry("1100x800")
+        self.root.minsize(900, 680)
         self.root.configure(bg="#f5f5f5")
 
         self.work_dir = Path(__file__).parent.parent
@@ -58,17 +59,67 @@ class DesignAutoGUI:
         content = Frame(main, bg="#f5f5f5")
         content.pack(fill="both", expand=True)
 
-        left = Frame(content, bg="#f5f5f5", width=500)
-        left.pack(side="left", fill="y", padx=(0, 10))
-        left.pack_propagate(False)
+        # ---------- 左侧面板：可滚动配置区 + 固定按钮区 ----------
+        left_container = Frame(content, bg="#f5f5f5", width=500)
+        left_container.pack(side="left", fill="both", padx=(0, 10))
+        left_container.pack_propagate(False)
 
-        self._build_files(left)
-        self._build_canvas(left)
-        self._build_align(left)
-        self._build_color(left)
-        self._build_output(left)
-        self._build_buttons(left)
+        # 按钮区固定在底部
+        button_area = Frame(left_container, bg="#f5f5f5")
+        button_area.pack(side="bottom", fill="x")
+        self._build_buttons(button_area)
 
+        # 上方可滚动配置区
+        canvas = Canvas(left_container, bg="#f5f5f5", highlightthickness=0, width=480)
+        vsb = Scrollbar(left_container, orient="vertical", command=canvas.yview)
+        self._left_canvas = canvas
+        canvas.configure(yscrollcommand=vsb.set)
+
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        self._left_inner = Frame(canvas, bg="#f5f5f5")
+        canvas_window = canvas.create_window((0, 0), window=self._left_inner, anchor="nw")
+
+        def _on_inner_configure(_evt=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(evt):
+            canvas.itemconfigure(canvas_window, width=evt.width)
+
+        self._left_inner.bind("<Configure>", _on_inner_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        # 支持鼠标滚轮滚动（仅当鼠标在左侧面板上时生效）
+        def _on_mousewheel(evt):
+            canvas.yview_scroll(int(-1 * (evt.delta / 120)), "units")
+
+        def _on_mousewheel_linux_up(evt):
+            canvas.yview_scroll(-1, "units")
+
+        def _on_mousewheel_linux_down(evt):
+            canvas.yview_scroll(1, "units")
+
+        def _bind_wheel(_evt=None):
+            canvas.bind_all("<MouseWheel>", _on_mousewheel)
+            canvas.bind_all("<Button-4>", _on_mousewheel_linux_up)
+            canvas.bind_all("<Button-5>", _on_mousewheel_linux_down)
+
+        def _unbind_wheel(_evt=None):
+            canvas.unbind_all("<MouseWheel>")
+            canvas.unbind_all("<Button-4>")
+            canvas.unbind_all("<Button-5>")
+
+        canvas.bind("<Enter>", _bind_wheel)
+        canvas.bind("<Leave>", _unbind_wheel)
+
+        self._build_files(self._left_inner)
+        self._build_canvas(self._left_inner)
+        self._build_align(self._left_inner)
+        self._build_color(self._left_inner)
+        self._build_output(self._left_inner)
+
+        # ---------- 右侧面板：预览 + 日志 ----------
         right = Frame(content, bg="#ffffff", bd=1, relief="solid")
         right.pack(side="right", fill="both", expand=True)
         self._build_preview(right)
@@ -195,22 +246,23 @@ class DesignAutoGUI:
         Label(row, textvariable=self.quality_var, bg="#f5f5f5", width=5).pack(side="left")
 
     def _build_buttons(self, parent):
-        sec = Frame(parent, bg="#f5f5f5", pady=12)
-        sec.pack(fill="x")
+        sec = Frame(parent, bg="#f5f5f5", pady=10)
+        sec.pack(fill="x", side="bottom")
 
         bf = Frame(sec, bg="#f5f5f5")
         bf.pack()
 
+        btn_opts = dict(font=("Microsoft YaHei", 11), width=10, fg="white", cursor="hand2")
         Button(bf, text="生成预览", command=self._on_preview,
-               font=("Microsoft YaHei", 11), width=12, bg="#3498db", fg="white").pack(side="left", padx=6)
+               bg="#3498db", **btn_opts).pack(side="left", padx=4)
         Button(bf, text="开始处理", command=self._on_process,
-               font=("Microsoft YaHei", 11, "bold"), width=12, bg="#27ae60", fg="white").pack(side="left", padx=6)
+               bg="#27ae60", font=("Microsoft YaHei", 11, "bold"), width=12, fg="white", cursor="hand2").pack(side="left", padx=4)
         Button(bf, text="重置参数", command=self._on_reset,
-               font=("Microsoft YaHei", 11), width=12, bg="#95a5a6", fg="white").pack(side="left", padx=6)
+               bg="#95a5a6", **btn_opts).pack(side="left", padx=4)
 
         self.status_var = StringVar(value="就绪")
         Label(sec, textvariable=self.status_var, font=("Microsoft YaHei", 10),
-              bg="#f5f5f5", fg="#e74c3c").pack(pady=(10, 0))
+              bg="#f5f5f5", fg="#e74c3c").pack(pady=(8, 0))
 
     def _build_preview(self, parent):
         hdr = Frame(parent, bg="#ecf0f1", padx=10, pady=5)
