@@ -11,10 +11,11 @@ Pillow 纯Python引擎实现
 """
 
 import logging
+import re
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import List
+from typing import List, Optional, Tuple
 
 from PIL import Image
 
@@ -22,6 +23,32 @@ from .base import ImageEngine
 from models import EngineCapabilities, LayerInfo
 
 logger = logging.getLogger(__name__)
+
+
+def get_eps_bbox(path: Path) -> Optional[Tuple[float, float]]:
+    """解析EPS文件的BoundingBox，返回 (宽度cm, 高度cm) 或 None
+
+    PostScript点数转厘米: points / 72 inches_per_point * 2.54 cm/inch
+    """
+    try:
+        with open(path, 'rb') as f:
+            raw = f.read(4096)
+        text = raw.decode('latin-1', errors='ignore')
+        m = re.search(r'%%BoundingBox:\s*(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)', text)
+        if not m:
+            logger.warning("未找到BoundingBox")
+            return None
+        x1, y1, x2, y2 = [float(m.group(i)) for i in range(1, 5)]
+        w_pts = abs(x2 - x1)
+        h_pts = abs(y2 - y1)
+        w_cm = w_pts / 72.0 * 2.54
+        h_cm = h_pts / 72.0 * 2.54
+        logger.info(f"EPS BoundingBox: {w_pts:.0f}x{h_pts:.0f}pt = {w_cm:.1f}x{h_cm:.1f}cm "
+                     f"({'横版' if w_cm > h_cm else '竖版'})")
+        return (w_cm, h_cm)
+    except Exception as e:
+        logger.warning(f"解析BoundingBox失败: {e}")
+        return None
 
 
 class PillowEngine(ImageEngine):

@@ -295,6 +295,24 @@ class DesignAutoGUI:
         p = filedialog.askopenfilename(title="选择EPS模板", filetypes=[("EPS", "*.eps"), ("所有文件", "*.*")])
         if p:
             self.eps_var.set(p)
+            self._auto_detect_eps_size(p)
+
+    def _auto_detect_eps_size(self, eps_path: str):
+        """加载EPS时自动检测bounding box方向并更新画布尺寸"""
+        try:
+            sys.path.insert(0, str(self.work_dir))
+            from engines.pillow_engine import get_eps_bbox
+            bbox = get_eps_bbox(Path(eps_path))
+            if bbox:
+                w_cm, h_cm = bbox
+                orientation = "横版" if w_cm > h_cm else "竖版"
+                self.width_cm_var.set(round(w_cm, 1))
+                self.height_cm_var.set(round(h_cm, 1))
+                self._log(f"检测到EPS尺寸: {w_cm:.1f}x{h_cm:.1f}cm ({orientation})")
+            else:
+                self._log("无法检测EPS尺寸，使用默认值")
+        except Exception as e:
+            self._log(f"检测EPS尺寸失败: {e}")
 
     def _browse_psd(self):
         p = filedialog.askopenfilename(title="选择PSD素材", filetypes=[("PSD", "*.psd"), ("所有文件", "*.*")])
@@ -312,6 +330,7 @@ class DesignAutoGUI:
         psd = list(self.work_dir.glob("*.psd"))
         if eps:
             self.eps_var.set(str(eps[0]))
+            self._auto_detect_eps_size(str(eps[0]))
         if psd:
             self.psd_var.set(str(psd[0]))
 
@@ -443,6 +462,9 @@ class DesignAutoGUI:
         for v in ["bright_var", "contrast_var", "sat_var", "hue_var", "warmth_var"]:
             getattr(self, v).set(0)
         self.quality_var.set(95)
+        eps_path = self.eps_var.get()
+        if eps_path and Path(eps_path).exists():
+            self._auto_detect_eps_size(eps_path)
         self._log("参数已重置")
 
 

@@ -16,6 +16,7 @@ from PIL import Image
 
 from models import ProcessConfig
 from engines.base import ImageEngine
+from engines.pillow_engine import get_eps_bbox
 from processors.aligner import SmartAligner
 from processors.color_adjuster import ColorAdjuster
 from processors.compositor import ImageCompositor
@@ -49,7 +50,7 @@ class DesignService:
         """
         执行完整的设计处理流程
 
-        流程：EPS栅格化 → PSD合成 → 对齐 → EPS轮廓蒙版裁剪 → 合成 → 色彩调整 → 保存
+        流程：EPS方向检测 → 栅格化 → PSD合成 → 对齐 → EPS轮廓蒙版裁剪 → 合成 → 色彩调整 → 保存
         """
         def _notify(msg: str):
             logger.info(msg)
@@ -60,15 +61,19 @@ class DesignService:
         psd_path = Path(config.psd_file)
         out_path = Path(config.output_file)
 
-        # 1. 栅格化 EPS（使用配置的厘米尺寸）
+        # 0. 自动检测EPS方向并调整画布尺寸
+        width_cm, height_cm = self._resolve_canvas_size(eps_path, config)
+        _notify(f"画布尺寸: {width_cm:.1f}x{height_cm:.1f}cm ({'横版' if width_cm > height_cm else '竖版'})")
+
+        # 1. 栅格化 EPS
         _notify("正在打开EPS模板...")
         base_img = self.engine.open_eps(
             eps_path, dpi=config.dpi,
-            width_cm=config.canvas_width_cm,
-            height_cm=config.canvas_height_cm,
+            width_cm=width_cm,
+            height_cm=height_cm,
         )
         logger.info(f"EPS栅格化: {base_img.width}x{base_img.height}px "
-                     f"({config.canvas_width_cm}x{config.canvas_height_cm}cm @ {config.dpi}dpi)")
+                     f"({width_cm:.1f}x{height_cm:.1f}cm @ {config.dpi}dpi)")
 
         # 2. 加载 PSD 图层
         _notify("正在加载PSD图层...")
@@ -123,13 +128,16 @@ class DesignService:
         preview_dpi = min(config.dpi, 72)
         logger.info(f"生成预览: EPS @ {preview_dpi}dpi, 目标宽度 {max_width}px")
 
+        eps_path = Path(config.eps_file)
+        width_cm, height_cm = self._resolve_canvas_size(eps_path, config)
+
         # 1. 栅格化 EPS
         base = self.engine.open_eps(
-            Path(config.eps_file), dpi=preview_dpi,
-            width_cm=config.canvas_width_cm,
-            height_cm=config.canvas_height_cm,
+            eps_path, dpi=preview_dpi,
+            width_cm=width_cm,
+            height_cm=height_cm,
         )
-        logger.info(f"EPS预览: {base.width}x{base.height}")
+        logger.info(f"EPS预览: {base.width}x{base.height} ({width_cm:.1f}x{height_cm:.1f}cm)")
 
         # 2. PSD 合成
         psd_path = Path(config.psd_file)
@@ -252,6 +260,44 @@ class DesignService:
         return Image.fromarray(result_arr, mode="RGBA").convert("RGB")
 
     # ---------- 辅助方法 ----------
+
+    def _resolve_canvas_size(self, eps_path: Path, config: ProcessConfig) -> tuple:
+        """解析画布尺寸：自动检测EPS bounding box，确保方向匹配
+
+        逻辑：
+        1. 解析EPS bounding box获取自然尺寸
+        2. 如果用户配置的方向与EPS不一致 → 使用EPS方向的尺寸
+        3. 如果一致 → 保持用户配置的尺寸
+        """
+        bbox = get_eps_bbox(eps_path)
+
+        configured_w = config.canvas_width_cm
+        configured_h = config.canvas_height_cm
+        configured_is_landscape = configured_w > configured_h
+
+        if bbox is not None:
+            bbox_w, bbox_h = bbox
+            bbox_is_landscape = bbox_w > bbox_h
+            bbox_ratio = bbox_w / bbox_h if bbox_h > 0 else 1
+
+            if configured_is_landscape != bbox_is_landscape:
+                logger.info(f"画布方向不匹配: 配置={configured_w}x{configured_h}cm, "
+                            f"EPS={bbox_w:.1f}x{bbox_h:.1f}cm, 自动调整方向")
+                # 根据EPS方向调整，保持配置的面积近似
+                area = configured_w * configured_h
+                if bbox_is_landscape:
+                    new_h = max(1.0, (area / bbox_ratio) ** 0.5)
+                    new_w = new_h * bbox_ratio
+                else:
+                    new_w = max(1.0, (area * bbox_ratio) ** 0.5)
+                    new_h = new_w / bbox_ratio
+                return round(new_w, 1), round(new_h, 1)
+            else:
+                logger.info(f"画布方向匹配: {configured_w}x{configured_h}cm")
+                return configured_w, configured_h
+        else:
+            logger.warning("无法解析EPS BoundingBox，使用配置尺寸")
+            return configured_w, configured_h
 
     def _prepare_pattern(self, psd_path: Path, layers) -> Image.Image:
         """获取花纹源图像
