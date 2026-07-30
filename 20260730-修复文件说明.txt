@@ -1,0 +1,61 @@
+一、预览图显示空白
+预览图原本是空白的，根本原因有 3 个：
+1. PSD 图层选择错误（最关键）
+    design_service.py:127 原本固定使用 layers[0]（白色背景层）作为花纹，但该 PSD 的 layers[0] 是纯白底。修复后用 psd-tools 的 psd.composite() 直接渲染 PSD 完整合成图，保留所有图层叠加效果。
+
+2. 缩放比例计算没有边界保护
+当 base 极小时（如 EPS 渲染失败），ratio = max_width / base.width 会变得极大，导致 pattern 被放大到画布外。修复后加上了：
+    base 尺寸异常时使用默认画布
+    pattern 等比缩放且用 min(width, height) 计算，确保贴入画布
+    偏移坐标用 max(0, ...) 防止负数
+
+3. 线程安全问题
+    gui/app.py:262 _log() 直接在工作线程修改 log_text 引发竞争，导致 UI 更新不及时。修复后将所有 UI 操作通过 root.after(0, ...) 调度到主线程。
+
+4. 错误诊断能力
+    engines/pillow_engine.py:44 添加了 EPS 文件存在性/大小检查、错误日志、尺寸阈值判断，便于排查类似问题。
+
+现在重新运行程序点击「生成预览」应该能看到 PSD 的完整合成图（米色底 + 蔓生花 + 边框）
+                            |
+                            |
+            此时的预览图是PSD完整的合成图，并没有与cad图进行整合
+                            |
+                  想要的预览图是最终效果图的预览
+
+二、预览图的显示修复
+1. EPS栅格化：使用厘米而非像素
+修改文件：pillow_engine.py
+    open_eps() 新增 width_cm / height_cm 参数
+    通过 Ghostscript 的 -dDEVICEWIDTHPOINTS / -dDEVICEHEIGHTPOINTS 强制按厘米输出
+    厘米转点数公式：cm / 2.54 × 72（1点 = 1/72英寸）
+
+2. 预览图显示最终合成效果
+修改文件：design_service.py
+    generate_preview() 完整复刻 process() 流程：EPS低DPI栅格化 → PSD合成 → 对齐 → EPS轮廓蒙版裁剪 → 色彩调整 → 预览
+    新增 _create_eps_mask() 使用 OpenCV 轮廓检测提取非白色区域作为蒙版
+    新增 _compose_with_eps_mask() 使用蒙版精确裁剪图案
+
+3. GUI添加画布尺寸输入
+修改文件：app.py
+    新增 _build_canvas() 区块：宽度(cm)、高度(cm)、DPI 输入框
+    更新 _collect_config() 将画布尺寸和DPI传入处理配置
+
+4. 智能对齐优化
+修改文件：aligner.py
+    缩放策略从 max（覆盖）改为 min（适配），确保图案完整显示在EPS边框内
+    缩放系数调整为 0.98 留边
+
+5. 验证结果
+        测试项	                  结果
+    预览生成（400px宽）	400×750，32.7%非白色像素 ✅
+    72dpi厘米栅格化	    精确匹配 2267×4251 ✅
+    300dpi厘米栅格化	    9446×17713（与预期差3px，可接受） ✅
+    完整处理流程	        9446×17713 厘米级精度输出 ✅
+
+
+
+
+
+
+
+
