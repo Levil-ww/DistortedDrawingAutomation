@@ -24,6 +24,7 @@ class SmartAligner:
     def align(self, base_img: Image.Image, pattern_img: Image.Image) -> Tuple[float, int, int]:
         """
         检测边框并计算最佳缩放和偏移
+        使用 min 缩放使图案适配（而非覆盖）边框区域
         Returns: (scale, offset_x, offset_y)
         """
         try:
@@ -63,7 +64,7 @@ class SmartAligner:
         pw, ph = pattern_img.size
         scale_x = w / pw
         scale_y = h / ph
-        scale = max(scale_x, scale_y) * 1.02
+        scale = min(scale_x, scale_y) * 0.98
 
         new_pw, new_ph = int(pw * scale), int(ph * scale)
         offset_x = x + (w - new_pw) // 2
@@ -74,7 +75,7 @@ class SmartAligner:
 
     def _center_fill(self, base_img: Image.Image, pattern_img: Image.Image) -> Tuple[float, int, int]:
         pw, ph = pattern_img.size
-        scale = max(base_img.width / pw, base_img.height / ph)
+        scale = min(base_img.width / pw, base_img.height / ph) * 0.98
         new_pw, new_ph = int(pw * scale), int(ph * scale)
         offset_x = (base_img.width - new_pw) // 2
         offset_y = (base_img.height - new_ph) // 2

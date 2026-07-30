@@ -30,10 +30,17 @@ class ImageEngine(ABC):
         ...
 
     @abstractmethod
-    def open_eps(self, path: Path, dpi: int = 300) -> Image.Image:
+    def open_eps(self, path: Path, dpi: int = 300,
+                 width_cm: float = None, height_cm: float = None) -> Image.Image:
         """
         打开并栅格化EPS文件，返回PIL Image
         所有引擎统一返回PIL Image，上层无需关心底层实现
+
+        Args:
+            path: EPS文件路径
+            dpi: 栅格化分辨率
+            width_cm: 目标宽度（厘米），用于覆盖EPS原始尺寸
+            height_cm: 目标高度（厘米），用于覆盖EPS原始尺寸
         """
         ...
 

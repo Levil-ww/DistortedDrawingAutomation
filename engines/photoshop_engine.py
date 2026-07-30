@@ -56,19 +56,26 @@ class PhotoshopEngine(ImageEngine):
 
     # ---------- 文件操作 ----------
 
-    def open_eps(self, path: Path, dpi: int = 300) -> Image.Image:
+    def open_eps(self, path: Path, dpi: int = 300,
+                 width_cm: float = None, height_cm: float = None) -> Image.Image:
         path_ps = str(path).replace("\\", "/")
+        extra = ""
+        if width_cm and height_cm:
+            width_in = width_cm / 2.54
+            height_in = height_cm / 2.54
+            extra = f'''
+        opt.width = {width_in};
+        opt.height = {height_in};'''
         js = f'''
         var f = new File("{path_ps}");
         var opt = new EPSOpenOptions();
         opt.antiAlias = true;
         opt.resolution = {dpi};
         opt.mode = OpenDocumentMode.RGB;
-        opt.cropTo = CropToType.MediaBox;
+        opt.cropTo = CropToType.MediaBox;{extra}
         app.open(f, opt);
         '''
         self._ps_app.doJavaScript(js)
-        # 导出为临时PNG再转为PIL，保证上层拿到统一类型
         return self._active_doc_to_pil()
 
     def load_psd_layers(self, path: Path) -> List[LayerInfo]:

@@ -33,30 +33,52 @@ class PillowEngine(ImageEngine):
             supports_photoshop_native=False,
             supports_clipping_mask=False,
             supports_smart_align=True,
-            supports_color_adjust=False,  # 由上层 processors 处理
+            supports_color_adjust=False,
             requires_external_app=False,
         )
+        Image.MAX_IMAGE_PIXELS = None
 
     @property
     def capabilities(self) -> EngineCapabilities:
         return self._caps
 
-    def open_eps(self, path: Path, dpi: int = 300) -> Image.Image:
-        """栅格化EPS文件"""
+    def open_eps(self, path: Path, dpi: int = 300,
+                 width_cm: float = None, height_cm: float = None) -> Image.Image:
+        """栅格化EPS文件
+
+        当指定 width_cm / height_cm 时，按物理尺寸 + DPI 计算像素，
+        通过 Ghostscript 的 -dDEVICEWIDTHPOINTS / -dDEVICEHEIGHTPOINTS 强制输出尺寸。
+        """
         if not path.exists():
             raise FileNotFoundError(f"EPS文件不存在: {path}")
 
         if path.stat().st_size < 100:
             raise ValueError(f"EPS文件过小({path.stat().st_size}字节)，可能已损坏: {path}")
 
+        # 计算目标像素尺寸
+        if width_cm and height_cm:
+            target_w = max(1, int(width_cm / 2.54 * dpi))
+            target_h = max(1, int(height_cm / 2.54 * dpi))
+            logger.info(f"目标物理尺寸: {width_cm}x{height_cm}cm @ {dpi}dpi = {target_w}x{target_h}px")
+        else:
+            target_w = target_h = None
+
         tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
         tmp.close()
         try:
             gs_cmd = [
                 "gswin64c", "-dNOPAUSE", "-dBATCH", "-sDEVICE=png16m",
-                f"-r{dpi}", f"-sOutputFile={tmp.name}", str(path)
+                f"-r{dpi}",
             ]
-            result = subprocess.run(gs_cmd, capture_output=True, timeout=60)
+            # 强制设备尺寸（点数 = cm / 2.54 * 72）
+            if width_cm and height_cm:
+                pts_w = max(1, int(width_cm / 2.54 * 72))
+                pts_h = max(1, int(height_cm / 2.54 * 72))
+                gs_cmd += [f"-dDEVICEWIDTHPOINTS={pts_w}", f"-dDEVICEHEIGHTPOINTS={pts_h}"]
+                gs_cmd += ["-dFitPage"]
+            gs_cmd += [f"-sOutputFile={tmp.name}", str(path)]
+
+            result = subprocess.run(gs_cmd, capture_output=True, timeout=120)
             if result.returncode == 0:
                 img = Image.open(tmp.name).convert("RGB")
                 logger.info(f"Ghostscript栅格化成功: {img.width}x{img.height}")
@@ -79,6 +101,9 @@ class PillowEngine(ImageEngine):
             logger.warning(f"PIL回退打开EPS: 原始尺寸{img.width}x{img.height}, 模式{img.mode}")
             if img.mode != "RGB":
                 img = img.convert("RGB")
+            if target_w and target_h and (img.width != target_w or img.height != target_h):
+                img = img.resize((target_w, target_h), Image.LANCZOS)
+                logger.info(f"PIL回退: 缩放到目标尺寸 {target_w}x{target_h}")
             if img.width < 50 or img.height < 50:
                 raise RuntimeError(
                     f"EPS栅格化失败: Ghostscript无法处理该文件，"

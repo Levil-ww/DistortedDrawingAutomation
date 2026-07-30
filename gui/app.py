@@ -63,6 +63,7 @@ class DesignAutoGUI:
         left.pack_propagate(False)
 
         self._build_files(left)
+        self._build_canvas(left)
         self._build_align(left)
         self._build_color(left)
         self._build_output(left)
@@ -93,6 +94,28 @@ class DesignAutoGUI:
             Button(row, text="浏览...", command=cmd, width=8).pack(side="left")
 
         self.out_var.set("output_v2.jpg")
+
+    def _build_canvas(self, parent):
+        sec = Frame(parent, bg="#f5f5f5", pady=8)
+        sec.pack(fill="x")
+        Label(sec, text="画布尺寸", font=("Microsoft YaHei", 12, "bold"),
+              bg="#f5f5f5", fg="#2c3e50").pack(anchor="w")
+
+        row = Frame(sec, bg="#f5f5f5")
+        row.pack(fill="x", pady=2)
+        Label(row, text="宽度(cm):", width=10, bg="#f5f5f5", anchor="e").pack(side="left")
+        self.width_cm_var = DoubleVar(value=80.0)
+        Entry(row, textvariable=self.width_cm_var, width=10).pack(side="left", padx=5)
+
+        Label(row, text="高度(cm):", width=10, bg="#f5f5f5", anchor="e").pack(side="left", padx=(20, 0))
+        self.height_cm_var = DoubleVar(value=150.0)
+        Entry(row, textvariable=self.height_cm_var, width=10).pack(side="left", padx=5)
+
+        row2 = Frame(sec, bg="#f5f5f5")
+        row2.pack(fill="x", pady=2)
+        Label(row2, text="DPI:", width=10, bg="#f5f5f5", anchor="e").pack(side="left")
+        self.dpi_var = IntVar(value=300)
+        Entry(row2, textvariable=self.dpi_var, width=10).pack(side="left", padx=5)
 
     def _build_align(self, parent):
         sec = Frame(parent, bg="#f5f5f5", pady=8)
@@ -245,6 +268,9 @@ class DesignAutoGUI:
             eps_file=self.eps_var.get(),
             psd_file=self.psd_var.get(),
             output_file=self.out_var.get(),
+            canvas_width_cm=self.width_cm_var.get(),
+            canvas_height_cm=self.height_cm_var.get(),
+            dpi=self.dpi_var.get(),
             smart_align=self.smart_align_var.get(),
             auto_scale=self.auto_scale_var.get(),
             margin_percent=self.margin_var.get(),
