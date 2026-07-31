@@ -12,5 +12,11 @@
 from .aligner import SmartAligner
 from .color_adjuster import ColorAdjuster
 from .compositor import ImageCompositor
+from .contour_extractor import ContourExtractor, ContourLevel
+from .layer_classifier import PSDLayerClassifier, LayerClassification
 
-__all__ = ["SmartAligner", "ColorAdjuster", "ImageCompositor"]
+__all__ = [
+    "SmartAligner", "ColorAdjuster", "ImageCompositor",
+    "ContourExtractor", "ContourLevel",
+    "PSDLayerClassifier", "LayerClassification",
+]

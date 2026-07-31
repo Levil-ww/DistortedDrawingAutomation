@@ -10,6 +10,7 @@ GUI 界面层 - 仅负责用户交互和状态显示
 """
 
 import os
+import re
 import sys
 import threading
 from pathlib import Path
@@ -332,7 +333,16 @@ class DesignAutoGUI:
             if size:
                 w, h = size
                 orientation = "横版" if w > h else "竖版"
-                self._log(f"检测到PSD素材尺寸: {w:.0f}x{h:.0f}cm ({orientation})")
+                # 从文件名检测是否有方向标注
+                psd_name = Path(psd_path).stem
+                has_direction_hint = bool(re.search(
+                    r'竖版|纵向|portrait|横版|横向|landscape',
+                    psd_name, re.IGNORECASE
+                ))
+                if has_direction_hint:
+                    self._log(f"检测到PSD素材尺寸: {w:.0f}x{h:.0f}cm ({orientation}, 按文件名方向标注)")
+                else:
+                    self._log(f"检测到PSD素材尺寸: {w:.0f}x{h:.0f}cm ({orientation}, 默认较长边为宽)")
 
                 # 检查与EPS的方向是否一致
                 eps_path = self.eps_var.get()
@@ -346,6 +356,8 @@ class DesignAutoGUI:
                             self._log(f"注意: PSD方向({orientation})与EPS"
                                       f"({'横版' if eps_landscape else '竖版'})不一致，"
                                       f"处理时会自动调整匹配")
+                        else:
+                            self._log(f"PSD方向({orientation})与EPS一致，无需调整")
             else:
                 self._log("PSD文件名未包含尺寸信息")
         except Exception as e:

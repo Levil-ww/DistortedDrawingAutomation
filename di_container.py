@@ -22,6 +22,8 @@ from engines import ImageEngine, create_engine
 from processors.aligner import SmartAligner
 from processors.color_adjuster import ColorAdjuster
 from processors.compositor import ImageCompositor
+from processors.contour_extractor import ContourExtractor
+from processors.layer_classifier import PSDLayerClassifier
 from services.design_service import DesignService
 from config_manager import ConfigManager
 
@@ -73,6 +75,12 @@ class DIContainer:
     def create_compositor(self) -> ImageCompositor:
         return ImageCompositor()
 
+    def create_contour_extractor(self) -> ContourExtractor:
+        return ContourExtractor()
+
+    def create_layer_classifier(self) -> PSDLayerClassifier:
+        return PSDLayerClassifier()
+
     # ---------- 服务组装 ----------
 
     def create_service(
@@ -80,6 +88,8 @@ class DIContainer:
         aligner: Optional[SmartAligner] = None,
         color_adjuster: Optional[ColorAdjuster] = None,
         compositor: Optional[ImageCompositor] = None,
+        contour_extractor: Optional[ContourExtractor] = None,
+        layer_classifier: Optional[PSDLayerClassifier] = None,
     ) -> DesignService:
         """
         创建完整配置的设计服务
@@ -90,6 +100,8 @@ class DIContainer:
             aligner=aligner or self.create_aligner(),
             color_adjuster=color_adjuster or self.create_color_adjuster(),
             compositor=compositor or self.create_compositor(),
+            contour_extractor=contour_extractor or self.create_contour_extractor(),
+            layer_classifier=layer_classifier or self.create_layer_classifier(),
         )
 
     # ---------- 配置管理 ----------
