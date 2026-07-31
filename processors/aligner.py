@@ -21,22 +21,26 @@ class SmartAligner:
     def __init__(self, margin_percent: float = 2.0):
         self.margin_percent = margin_percent
 
-    def align(self, base_img: Image.Image, pattern_img: Image.Image) -> Tuple[float, int, int]:
+    def align(self, base_img: Image.Image, pattern_img: Image.Image,
+              fill_mode: str = "cover") -> Tuple[float, int, int]:
         """
         检测边框并计算最佳缩放和偏移
-        使用 min 缩放使图案适配（而非覆盖）边框区域
-        Returns: (scale, offset_x, offset_y)
+
+        Args:
+            fill_mode: "cover" = max缩放覆盖整个区域（无留白，可能裁剪图案）
+                      "contain" = min缩放适配区域（保持完整图案，可能有留白）
         """
         try:
-            return self._detect_border_align(base_img, pattern_img)
+            return self._detect_border_align(base_img, pattern_img, fill_mode)
         except ImportError:
             logger.warning("OpenCV未安装，使用居中填充")
-            return self._center_fill(base_img, pattern_img)
+            return self._center_fill(base_img, pattern_img, fill_mode)
         except Exception as e:
             logger.warning(f"智能对齐失败: {e}，使用居中填充")
-            return self._center_fill(base_img, pattern_img)
+            return self._center_fill(base_img, pattern_img, fill_mode)
 
-    def _detect_border_align(self, base_img: Image.Image, pattern_img: Image.Image) -> Tuple[float, int, int]:
+    def _detect_border_align(self, base_img: Image.Image, pattern_img: Image.Image,
+                              fill_mode: str = "cover") -> Tuple[float, int, int]:
         import cv2
 
         cv_img = cv2.cvtColor(np.array(base_img), cv2.COLOR_RGB2BGR)
@@ -49,7 +53,7 @@ class SmartAligner:
 
         contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
-            return self._center_fill(base_img, pattern_img)
+            return self._center_fill(base_img, pattern_img, fill_mode)
 
         max_contour = max(contours, key=cv2.contourArea)
         x, y, w, h = cv2.boundingRect(max_contour)
@@ -62,20 +66,35 @@ class SmartAligner:
         h = min(base_img.height - y, h + mh * 2)
 
         pw, ph = pattern_img.size
-        scale_x = w / pw
-        scale_y = h / ph
-        scale = min(scale_x, scale_y) * 0.98
 
-        new_pw, new_ph = int(pw * scale), int(ph * scale)
-        offset_x = x + (w - new_pw) // 2
-        offset_y = y + (h - new_ph) // 2
+        if fill_mode == "cover":
+            # cover: 基于全图尺寸放大，pattern覆盖整个画布，确保无留白
+            scale_x = base_img.width / pw
+            scale_y = base_img.height / ph
+            scale = max(scale_x, scale_y) * 1.02
+            # cover模式：相对于整个base图像居中
+            new_pw, new_ph = int(pw * scale), int(ph * scale)
+            offset_x = (base_img.width - new_pw) // 2
+            offset_y = (base_img.height - new_ph) // 2
+        else:
+            # contain: 基于边框区域缩小，保持完整图案适配
+            scale_x = w / pw
+            scale_y = h / ph
+            scale = min(scale_x, scale_y) * 0.98
+            new_pw, new_ph = int(pw * scale), int(ph * scale)
+            offset_x = x + (w - new_pw) // 2
+            offset_y = y + (h - new_ph) // 2
 
-        logger.info(f"智能对齐: 边框({x},{y},{w},{h}), 缩放={scale:.3f}, 偏移=({offset_x},{offset_y})")
+        logger.info(f"智能对齐[{fill_mode}]: 边框({x},{y},{w},{h}), 缩放={scale:.3f}, 偏移=({offset_x},{offset_y})")
         return scale, offset_x, offset_y
 
-    def _center_fill(self, base_img: Image.Image, pattern_img: Image.Image) -> Tuple[float, int, int]:
+    def _center_fill(self, base_img: Image.Image, pattern_img: Image.Image,
+                     fill_mode: str = "cover") -> Tuple[float, int, int]:
         pw, ph = pattern_img.size
-        scale = min(base_img.width / pw, base_img.height / ph) * 0.98
+        if fill_mode == "cover":
+            scale = max(base_img.width / pw, base_img.height / ph) * 1.02
+        else:
+            scale = min(base_img.width / pw, base_img.height / ph) * 0.98
         new_pw, new_ph = int(pw * scale), int(ph * scale)
         offset_x = (base_img.width - new_pw) // 2
         offset_y = (base_img.height - new_ph) // 2

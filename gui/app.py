@@ -318,6 +318,38 @@ class DesignAutoGUI:
         p = filedialog.askopenfilename(title="选择PSD素材", filetypes=[("PSD", "*.psd"), ("所有文件", "*.*")])
         if p:
             self.psd_var.set(p)
+            self._auto_detect_psd_size(p)
+
+    def _auto_detect_psd_size(self, psd_path: str):
+        """加载PSD时检测素材尺寸，仅用于方向校验，不覆盖EPS画布尺寸"""
+        try:
+            sys.path.insert(0, str(self.work_dir))
+            from services.design_service import _parse_psd_size_from_filename
+            from engines.pillow_engine import get_eps_bbox
+            from pathlib import Path
+
+            size = _parse_psd_size_from_filename(Path(psd_path))
+            if size:
+                w, h = size
+                orientation = "横版" if w > h else "竖版"
+                self._log(f"检测到PSD素材尺寸: {w:.0f}x{h:.0f}cm ({orientation})")
+
+                # 检查与EPS的方向是否一致
+                eps_path = self.eps_var.get()
+                if eps_path:
+                    bbox = get_eps_bbox(Path(eps_path))
+                    if bbox:
+                        eps_w, eps_h = bbox
+                        psd_landscape = w > h
+                        eps_landscape = eps_w > eps_h
+                        if psd_landscape != eps_landscape:
+                            self._log(f"注意: PSD方向({orientation})与EPS"
+                                      f"({'横版' if eps_landscape else '竖版'})不一致，"
+                                      f"处理时会自动调整匹配")
+            else:
+                self._log("PSD文件名未包含尺寸信息")
+        except Exception as e:
+            self._log(f"检测PSD尺寸失败: {e}")
 
     def _browse_out(self):
         p = filedialog.asksaveasfilename(title="输出路径", defaultextension=".jpg",

@@ -9,8 +9,9 @@
 """
 
 import logging
+import re
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
 from PIL import Image
 
@@ -22,6 +23,25 @@ from processors.color_adjuster import ColorAdjuster
 from processors.compositor import ImageCompositor
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_psd_size_from_filename(psd_path: Path) -> Optional[Tuple[float, float]]:
+    """从PSD文件名解析素材尺寸 (width_cm, height_cm)
+
+    支持格式:
+        蔓生花80-140.psd -> (80, 140)
+        pattern_80x140.psd -> (80, 140)
+        design_80_140.psd -> (80, 140)
+    """
+    name = psd_path.stem
+    # 尝试匹配 80-140, 80x140, 80_140 格式
+    m = re.search(r'(?i)(\d+)[\-_xX](\d+)', name)
+    if m:
+        w, h = float(m.group(1)), float(m.group(2))
+        if w > 0 and h > 0:
+            logger.info(f"从文件名解析PSD尺寸: {name} -> {w:.0f}x{h:.0f}cm")
+            return (w, h)
+    return None
 
 
 class DesignService:
@@ -182,122 +202,216 @@ class DesignService:
 
     def _compute_alignment(self, base_img: Image.Image, pattern_img: Image.Image,
                            config: ProcessConfig):
-        """计算对齐参数（缩放 + 偏移）"""
+        """计算对齐参数（缩放 + 偏移）
+
+        使用 cover 模式（max缩放），确保图案完全覆盖边框区域，无留白。
+        """
         if config.smart_align and config.auto_scale:
-            logger.info("使用智能对齐...")
-            return self.aligner.align(base_img, pattern_img)
+            logger.info("使用智能对齐[cover]...")
+            return self.aligner.align(base_img, pattern_img, fill_mode="cover")
         else:
             scale = config.pattern_scale if config.pattern_scale != 1.0 else (
-                min(base_img.width / pattern_img.width,
-                    base_img.height / pattern_img.height) * 0.98
+                max(base_img.width / pattern_img.width,
+                    base_img.height / pattern_img.height) * 1.02
             )
             ox = config.pattern_offset_x or (base_img.width - int(pattern_img.width * scale)) // 2
             oy = config.pattern_offset_y or (base_img.height - int(pattern_img.height * scale)) // 2
             return scale, ox, oy
 
     def _create_eps_mask(self, base_img: Image.Image) -> Image.Image:
-        """从 EPS 栅格化图像中提取 CAD 轮廓并填充为蒙版
+        """从 EPS 栅格化图像中提取外轮廓作为填充蒙版
 
-        使用 OpenCV 检测非白色像素（CAD 线），找到最大轮廓并填充。
-        返回 L 模式蒙版：255=轮廓区域内, 0=外部
+        使用轮廓检测找到EPS形状的外边界，填充整个内部区域作为蒙版。
+        这样PSD素材能正确填充到EPS形状内部，且边框弧度与外轮廓一致。
+        返回 L 模式蒙版：255=填充区域内, 0=外部
         """
+        import numpy as np
+
         try:
             import cv2
-            import numpy as np
 
-            cv_img = cv2.cvtColor(np.array(base_img), cv2.COLOR_RGB2GRAY)
+            gray = cv2.cvtColor(np.array(base_img), cv2.COLOR_RGB2GRAY)
 
-            _, binary = cv2.threshold(cv_img, 250, 255, cv2.THRESH_BINARY_INV)
+            # 二值化：背景变白(255)，CAD线框/图形变黑(0)
+            _, binary = cv2.threshold(gray, 250, 255, cv2.THRESH_BINARY)
 
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-            binary = cv2.dilate(binary, kernel, iterations=1)
-            binary = cv2.erode(binary, kernel, iterations=1)
+            # 形态学闭运算：闭合线框的微小缺口，形成完整轮廓
+            kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+            closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel_close, iterations=3)
 
-            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if contours:
-                mask_img = np.zeros((base_img.height, base_img.width), dtype=np.uint8)
-                cv2.drawContours(mask_img, contours, -1, 255, thickness=cv2.FILLED)
-                total_pixels = base_img.width * base_img.height
-                mask_pixels = int(np.sum(mask_img > 0))
-                logger.info(f"EPS蒙版(轮廓填充): {mask_pixels}/{total_pixels} ({mask_pixels/total_pixels*100:.2f}%)")
+            # 转换为线为白色、背景为黑色的图以便轮廓检测
+            # 背景=0(黑), 线框=255(白)
+            inv = cv2.bitwise_not(closed)
+
+            # 再做一次膨胀腐蚀，确保轮廓完整
+            kernel_dilate = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+            inv = cv2.dilate(inv, kernel_dilate, iterations=2)
+            inv = cv2.erode(inv, kernel_dilate, iterations=1)
+
+            # 查找外轮廓（使用RETR_EXTERNAL只获取最外层轮廓）
+            contours, hierarchy = cv2.findContours(inv, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            if not contours:
+                logger.warning("未检测到任何轮廓，尝试回退方案")
+                return self._create_eps_mask_fallback(base_img)
+
+            # 找到面积最大的轮廓（即EPS形状的外轮廓）
+            largest_contour = max(contours, key=cv2.contourArea)
+
+            # 创建蒙版：填充最大轮廓的内部区域
+            mask_img = np.zeros((base_img.height, base_img.width), dtype=np.uint8)
+            cv2.fillPoly(mask_img, [largest_contour], 255)
+
+            # 形态学开运算去除边缘毛刺
+            kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            mask_img = cv2.morphologyEx(mask_img, cv2.MORPH_OPEN, kernel_open, iterations=1)
+
+            total_pixels = base_img.width * base_img.height
+            mask_pixels = int(np.sum(mask_img > 0))
+            ratio = mask_pixels / total_pixels * 100
+            logger.info(f"EPS蒙版(外轮廓填充): {mask_pixels}/{total_pixels} ({ratio:.2f}%)")
+
+            if mask_pixels > 0:
                 return Image.fromarray(mask_img, mode="L")
+            else:
+                logger.warning("轮廓面积为0，尝试回退方案")
         except ImportError:
-            logger.warning("OpenCV不可用，使用简化蒙版")
+            logger.warning("OpenCV未安装，使用回退方案")
+        except Exception as e:
+            logger.warning(f"外轮廓蒙版失败: {e}")
 
-        # 回退：简单的非白色像素检测
-        gray = base_img.convert("L")
-        w, h = gray.size
-        mask = Image.new("L", (w, h), 0)
-        from PIL import Image as PILImage
+        return self._create_eps_mask_fallback(base_img)
+
+    def _create_eps_mask_fallback(self, base_img: Image.Image) -> Image.Image:
+        """回退方案：使用边框矩形检测"""
         import numpy as np
-        arr = np.array(gray)
-        mask_arr = np.where(arr < 250, 255, 0).astype(np.uint8)
-        mask = Image.fromarray(mask_arr, mode="L")
-        return mask
+
+        try:
+            import cv2
+
+            gray = cv2.cvtColor(np.array(base_img), cv2.COLOR_RGB2GRAY)
+            _, binary = cv2.threshold(gray, 250, 255, cv2.THRESH_BINARY)
+
+            # 膨胀连接所有线条
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+            dilated = cv2.dilate(binary, kernel, iterations=3)
+            eroded = cv2.erode(dilated, kernel, iterations=2)
+
+            # 从四角做floodFill标记背景
+            h, w = eroded.shape
+            flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+            flood_img = eroded.copy()
+
+            seeds = [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)]
+            for sx, sy in seeds:
+                if 0 <= sx < w and 0 <= sy < h and flood_img[sy, sx] == 255:
+                    cv2.floodFill(flood_img, flood_mask, (sx, sy), 128)
+
+            # 封闭区域：值仍为255
+            region_mask = np.where(flood_img == 255, 255, 0).astype(np.uint8)
+
+            if np.sum(region_mask > 0) > 0:
+                logger.info("EPS蒙版(回退floodFill)")
+                return Image.fromarray(region_mask, mode="L")
+        except Exception:
+            pass
+
+        # 最终回退：全图蒙版
+        logger.warning("所有蒙版检测失败，使用全图蒙版")
+        return Image.new("L", base_img.size, 255)
 
     def _compose_with_eps_mask(self, base: Image.Image, pattern: Image.Image,
                                 offset_x: int, offset_y: int,
-                                eps_mask: Image.Image) -> Image.Image:
+                                eps_mask: Image.Image,
+                                overlay_border: bool = True) -> Image.Image:
         """使用 EPS 轮廓蒙版合成图案
 
-        将花纹粘贴到 base，然后用 EPS 轮廓蒙版裁剪 alpha 通道。
+        合成逻辑：
+        1. 在画布上放置缩放后的PSD花纹图案
+        2. 用EPS蒙版裁剪（图案仅在EPS形状内部可见）
+        3. 叠加CAD边框线（确保边框线在花纹上层）
+        4. 边框弧度与EPS外轮廓保持一致
+
+        Args:
+            base: 原始EPS栅格化图像（含CAD线稿）
+            pattern: 缩放后的PSD花纹图像
+            offset_x, offset_y: 花纹放置位置
+            eps_mask: EPS轮廓蒙版（L模式）
+            overlay_border: 是否叠加CAD边框线
         """
         import numpy as np
 
-        result = base.convert("RGBA")
+        w, h = base.size
+
+        # 1. 创建画布并放置花纹图案
+        canvas = Image.new("RGBA", (w, h), (255, 255, 255, 255))
         pattern_rgba = pattern.convert("RGBA")
+        canvas.paste(pattern_rgba, (offset_x, offset_y), pattern_rgba)
 
-        result.paste(pattern_rgba, (offset_x, offset_y), pattern_rgba)
-
-        # 用 EPS 蒙版合成 alpha 通道
-        result_arr = np.array(result)
+        canvas_arr = np.array(canvas)
         mask_arr = np.array(eps_mask)
-        result_alpha = result_arr[:, :, 3].astype(np.uint16)
-        mask_bin = (mask_arr > 128).astype(np.uint16)
-        new_alpha = (result_alpha * mask_bin).astype(np.uint8)
-        result_arr[:, :, 3] = new_alpha
+        mask_bin = (mask_arr > 128).astype(np.uint8)
 
-        return Image.fromarray(result_arr, mode="RGBA").convert("RGB")
+        # 2. 用蒙版裁剪：形状内部保留花纹，外部设为白色
+        for c in range(3):
+            canvas_arr[:, :, c] = np.where(mask_bin, canvas_arr[:, :, c], 255)
+        canvas_arr[:, :, 3] = 255
+
+        # 3. 叠加 CAD 边框线（从base中提取深色像素，叠加在花纹上层）
+        #    边框线会自然跟随EPS外轮廓的弧度
+        if overlay_border:
+            base_arr = np.array(base.convert("RGBA"))
+            # 检测base中的深色像素（CAD线稿）
+            is_dark = np.any(base_arr[:, :, :3] < 120, axis=2)
+            # 仅保留形状内部的深色像素作为边框
+            is_border = is_dark & (mask_bin > 0)
+
+            if np.any(is_border):
+                for c in range(3):
+                    canvas_arr[:, :, c] = np.where(
+                        is_border, base_arr[:, :, c], canvas_arr[:, :, c]
+                    )
+                logger.info(f"叠加CAD边框线: {np.sum(is_border)} 像素")
+
+        return Image.fromarray(canvas_arr, mode="RGBA").convert("RGB")
 
     # ---------- 辅助方法 ----------
 
     def _resolve_canvas_size(self, eps_path: Path, config: ProcessConfig) -> tuple:
-        """解析画布尺寸：自动检测EPS bounding box，确保方向匹配
+        """解析画布尺寸：以EPS文件尺寸为准，PSD仅作方向参考
 
         逻辑：
-        1. 解析EPS bounding box获取自然尺寸
-        2. 如果用户配置的方向与EPS不一致 → 使用EPS方向的尺寸
-        3. 如果一致 → 保持用户配置的尺寸
+        1. 优先从EPS BoundingBox获取物理尺寸作为画布大小
+        2. 若EPS尺寸获取失败，回退到配置的画布尺寸
+        3. 若PSD方向与EPS不匹配，自动交换画布宽高
         """
         bbox = get_eps_bbox(eps_path)
 
+        if bbox is not None:
+            eps_w, eps_h = bbox
+            bbox_is_landscape = eps_w > eps_h
+
+            # 检查PSD方向是否与EPS匹配
+            psd_path = Path(config.psd_file) if config.psd_file else None
+            psd_size = _parse_psd_size_from_filename(psd_path) if psd_path else None
+            if psd_size is not None:
+                psd_w, psd_h = psd_size
+                psd_is_landscape = psd_w > psd_h
+                if psd_is_landscape != bbox_is_landscape:
+                    logger.info(f"PSD方向与EPS不匹配，交换画布方向: "
+                                f"EPS={eps_w:.1f}x{eps_h:.1f}cm -> "
+                                f"{eps_h:.1f}x{eps_w:.1f}cm")
+                    return round(eps_h, 1), round(eps_w, 1)
+
+            logger.info(f"使用EPS尺寸作为画布: {eps_w:.1f}x{eps_h:.1f}cm "
+                        f"({'横版' if bbox_is_landscape else '竖版'})")
+            return round(eps_w, 1), round(eps_h, 1)
+
+        # 回退：使用配置的尺寸
         configured_w = config.canvas_width_cm
         configured_h = config.canvas_height_cm
-        configured_is_landscape = configured_w > configured_h
-
-        if bbox is not None:
-            bbox_w, bbox_h = bbox
-            bbox_is_landscape = bbox_w > bbox_h
-            bbox_ratio = bbox_w / bbox_h if bbox_h > 0 else 1
-
-            if configured_is_landscape != bbox_is_landscape:
-                logger.info(f"画布方向不匹配: 配置={configured_w}x{configured_h}cm, "
-                            f"EPS={bbox_w:.1f}x{bbox_h:.1f}cm, 自动调整方向")
-                # 根据EPS方向调整，保持配置的面积近似
-                area = configured_w * configured_h
-                if bbox_is_landscape:
-                    new_h = max(1.0, (area / bbox_ratio) ** 0.5)
-                    new_w = new_h * bbox_ratio
-                else:
-                    new_w = max(1.0, (area * bbox_ratio) ** 0.5)
-                    new_h = new_w / bbox_ratio
-                return round(new_w, 1), round(new_h, 1)
-            else:
-                logger.info(f"画布方向匹配: {configured_w}x{configured_h}cm")
-                return configured_w, configured_h
-        else:
-            logger.warning("无法解析EPS BoundingBox，使用配置尺寸")
-            return configured_w, configured_h
+        logger.warning(f"无法解析EPS BoundingBox，使用配置尺寸: {configured_w}x{configured_h}cm")
+        return configured_w, configured_h
 
     def _prepare_pattern(self, psd_path: Path, layers) -> Image.Image:
         """获取花纹源图像
