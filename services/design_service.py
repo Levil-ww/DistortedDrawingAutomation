@@ -130,13 +130,19 @@ class DesignService:
         _notify("正在分类PSD图层...")
         classifications = self.layer_classifier.classify_layers(psd_layers, psd_composite)
 
-        # 6. 多层渲染
-        _notify("正在逐层渲染...")
-        result = self._render_multi_layer(
-            base_img, contour_levels, classifications, psd_composite, config
-        )
+        # 6. 多层渲染（优先使用PSD合成图整体渲染，确保所有效果正确）
+        if psd_composite:
+            _notify("使用PSD合成图渲染（包含所有图层效果）...")
+            result = self._render_with_psd_composite(
+                base_img, contour_levels, psd_composite, config
+            )
+        else:
+            _notify("正在逐层渲染...")
+            result = self._render_multi_layer(
+                base_img, contour_levels, classifications, psd_composite, config
+            )
 
-        # 7. 色彩调整
+        # 8. 色彩调整
         _notify("正在应用色彩调整...")
         result = self.color_adjuster.adjust(
             result,
@@ -147,7 +153,7 @@ class DesignService:
             warmth=config.warmth,
         )
 
-        # 8. 保存
+        # 9. 保存
         _notify("正在保存JPG...")
         self.engine.save_jpg(result, out_path, quality=config.jpg_quality)
         _notify(f"处理完成: {out_path}")
@@ -181,10 +187,15 @@ class DesignService:
         psd_composite = self._prepare_psd_composite(psd_path, psd_layers)
         classifications = self.layer_classifier.classify_layers(psd_layers, psd_composite)
 
-        # 4. 多层渲染
-        result = self._render_multi_layer(
-            base, contour_levels, classifications, psd_composite, config
-        )
+        # 4. 多层渲染（优先使用PSD合成图整体渲染）
+        if psd_composite:
+            result = self._render_with_psd_composite(
+                base, contour_levels, psd_composite, config
+            )
+        else:
+            result = self._render_multi_layer(
+                base, contour_levels, classifications, psd_composite, config
+            )
 
         # 5. 色彩调整
         result = self.color_adjuster.adjust(
@@ -211,145 +222,166 @@ class DesignService:
                              classifications: List[LayerClassification],
                              psd_composite: Image.Image,
                              config: ProcessConfig) -> Image.Image:
-        """多层轮廓跟随渲染
+        """多层轮廓跟随渲染（正确版v2）
 
-        核心逻辑：
-        1. 对每个PSD图层，使用对应的EPS轮廓蒙版进行裁剪
-        2. 内层图层的蒙版通过腐蚀外层轮廓获得（保持边框间距）
-        3. PSD像素距离 → EPS像素距离通过缩放因子转换
-        4. 图层按Z序合成（从最底层到最顶层）
-        5. 最终叠加CAD边框线
-
-        关键改进：
-        - 腐蚀量直接基于PSD图层在PSD素材中的边框距离
-        - 对齐使用腐蚀后蒙版的边界矩形，确保PSD边框与EPS轮廓对齐
-        - Z序合成使用正确的图层顺序
+        核心思路：
+        1. 使用最外层EPS轮廓作为基础蒙版
+        2. 按PSD图层内缩距离从小到大排序
+        3. 为每层计算腐蚀值（确保层间有足够间距）
+        4. 每层蒙版 = 基础蒙版腐蚀(腐蚀值)
+        5. 描边 = 相邻两层蒙版的差集（统一深棕色）
+        6. Z序合成：最外层先渲染，内层后渲染覆盖
         """
         w, h = base_img.size
         canvas = Image.new("RGBA", (w, h), (255, 255, 255, 255))
 
-        contour_masks = [cl.mask for cl in contour_levels]
-        if not contour_masks:
-            contour_masks = [Image.new("L", (w, h), 255)]
+        # 使用最外层轮廓作为基础（所有层都基于此腐蚀）
+        if not contour_levels:
+            base_mask = Image.new("L", (w, h), 255)
+            base_rect = (0, 0, w, h)
+        else:
+            base_mask = contour_levels[0].mask
+            base_rect = contour_levels[0].bounding_rect
 
-        # 1. 计算PSD整体边界和每个图层的边框位置
+        bx, by, bw, bh = base_rect
+        min_dim = min(bw, bh)
+
+        # 1. 计算PSD整体边界
         psd_bounds = self._get_psd_bounds(classifications)
         px, py, pw, ph = psd_bounds
 
-        # 2. 收集所有待渲染的图层数据
-        layer_render_data = []
+        # 2. 计算PSD→EPS缩放比
+        scale_x = bw / pw if pw > 0 else 1.0
+        scale_y = bh / ph if ph > 0 else 1.0
 
-        for cls in classifications:
+        # 3. 为每层计算PSD内缩距离（PSD像素→EPS像素）
+        layer_data = []  # (orig_idx, erosion_eps, cls)
+        for orig_idx, cls in enumerate(classifications):
+            if cls.area <= 0:
+                continue
+
+            lx, ly, lw, lh = cls.bounding_rect
+            left_inset = lx - px
+            right_inset = (px + pw) - (lx + lw)
+            top_inset = ly - py
+            bottom_inset = (py + ph) - (ly + lh)
+
+            insets = [d for d in [left_inset, top_inset, right_inset, bottom_inset] if d > 0]
+            if insets and scale_x > 0:
+                median_inset = sorted(insets)[len(insets) // 2]
+                erosion_eps = int(median_inset * scale_x)
+            else:
+                erosion_eps = 0
+
+            layer_data.append((orig_idx, erosion_eps, cls))
+
+        # 4. 按腐蚀值从小到大排序（外层先）
+        layer_data.sort(key=lambda x: x[1])
+
+        # 5. 确保腐蚀值单调递增且层间距足够大
+        # 每层间距至少为 min_dim * 0.04（约4%的最小边）
+        min_layer_gap = max(5, int(min_dim * 0.04))
+        max_erosion = int(min_dim * 0.4)  # 最大腐蚀40%的最小维度
+
+        final_erosions = []
+        for orig_idx, erosion, cls in layer_data:
+            if final_erosions:
+                prev_erosion = final_erosions[-1][1]
+                if erosion <= prev_erosion:
+                    erosion = prev_erosion + min_layer_gap
+                elif erosion - prev_erosion < min_layer_gap:
+                    erosion = prev_erosion + min_layer_gap
+            erosion = min(erosion, max_erosion)
+            final_erosions.append((orig_idx, erosion))
+
+        logger.info(f"各层腐蚀值(EPS像素): "
+                     f"{[(classifications[i].layer.name, e) for i, e in final_erosions]}")
+
+        # 6. 为每层创建蒙版
+        layer_masks = {}
+        for orig_idx, erosion in final_erosions:
+            if erosion > 0:
+                mask = self.contour_extractor.erode_mask(base_mask, erosion)
+            else:
+                mask = base_mask.copy()
+            layer_masks[orig_idx] = mask
+
+        # 7. 计算描边环（统一深棕色描边）
+        stroke_rings = {}
+        sorted_orig_indices = [idx for idx, _ in final_erosions]
+
+        # 最外层描边：base_mask - 最外层腐蚀后蒙版
+        if sorted_orig_indices:
+            first_idx = sorted_orig_indices[0]
+            first_mask = layer_masks[first_idx]
+            if final_erosions[0][1] > 0:
+                outer_stroke = self.contour_extractor.create_border_ring_mask(
+                    base_mask, first_mask
+                )
+                stroke_rings[first_idx] = outer_stroke
+
+        # 层间描边：外层蒙版 - 内层蒙版
+        for i in range(1, len(sorted_orig_indices)):
+            outer_idx = sorted_orig_indices[i - 1]
+            inner_idx = sorted_orig_indices[i]
+            outer_mask = layer_masks[outer_idx]
+            inner_mask = layer_masks[inner_idx]
+            stroke_ring = self.contour_extractor.create_border_ring_mask(
+                outer_mask, inner_mask
+            )
+            stroke_rings[inner_idx] = stroke_ring
+
+        # 8. 第一遍：Z序合成（从最外层到最内层，所有图层填充）
+        for orig_idx, erosion in final_erosions:
+            cls = classifications[orig_idx]
             layer_img = cls.layer.image
             if layer_img.mode != "RGBA":
                 layer_img = layer_img.convert("RGBA")
 
-            # 该PSD图层在PSD中的边框位置
-            lx, ly, lw, lh = cls.bounding_rect
+            layer_mask = layer_masks[orig_idx]
 
-            # PSD图层相对于PSD外边界的内缩距离
-            left_inset = lx - px
-            top_inset = ly - py
-            right_inset = (px + pw) - (lx + lw)
-            bottom_inset = (py + ph) - (ly + lh)
-
-            insets = [d for d in [left_inset, top_inset, right_inset, bottom_inset] if d > 0]
-
-            # 对应轮廓蒙版
-            contour_idx = min(cls.contour_level, len(contour_masks) - 1)
-            contour_level = contour_levels[contour_idx]
-            base_mask = contour_masks[contour_idx]
-
-            # 计算PSD→EPS缩放比（基于对应轮廓的边界矩形）
-            contour_rect = contour_level.bounding_rect
-            cw, ch = contour_rect[2], contour_rect[3]
-            scale_x = cw / pw if pw > 0 else 1.0
-            scale_y = ch / ph if ph > 0 else 1.0
-
-            # 计算腐蚀量（EPS像素）
-            if insets and scale_x > 0:
-                # 使用所有有效inset的中位数，映射到EPS坐标
-                median_inset = sorted(insets)[len(insets) // 2]
-                erosion_eps = int(median_inset * scale_x)
-                erosion_eps = max(0, min(erosion_eps, min(cw, ch) // 4))
-            else:
-                erosion_eps = 0
-
-            # 腐蚀轮廓蒙版，得到该层的有效区域
-            if erosion_eps > 0:
-                layer_mask = self.contour_extractor.erode_mask(base_mask, erosion_eps)
-            else:
-                layer_mask = base_mask.copy()
-
-            # 使用腐蚀后蒙版的边界进行对齐
+            # 蒙版边界
             mask_arr = np.array(layer_mask)
-            ys, xs = np.where(mask_arr > 128)
-            if len(xs) > 0:
-                mx, my = int(xs.min()), int(ys.min())
-                mw, mh = int(xs.max() - mx + 1), int(ys.max() - my + 1)
+            mask_ys, mask_xs = np.where(mask_arr > 128)
+            if len(mask_xs) > 0:
+                mx, my = int(mask_xs.min()), int(mask_ys.min())
+                mw, mh = int(mask_xs.max() - mx + 1), int(mask_ys.max() - my + 1)
             else:
                 mx, my, mw, mh = 0, 0, w, h
 
-            # 计算缩放：PSD图层适配腐蚀后区域
-            psd_layer_w = lw
-            psd_layer_h = lh
-            if psd_layer_w > 0 and psd_layer_h > 0 and mw > 0 and mh > 0:
-                scale_x_psd = mw / psd_layer_w
-                scale_y_psd = mh / psd_layer_h
-                scale = max(scale_x_psd, scale_y_psd) * 1.02
+            # PSD图层实际内容边界（alpha > 1）
+            arr = np.array(layer_img)
+            alpha = arr[:, :, 3]
+            non_transparent = np.where(alpha > 1)
+            if len(non_transparent[0]) == 0:
+                logger.warning(f"图层 '{cls.layer.name}' 无可见内容，跳过")
+                continue
+
+            ys, xs = non_transparent
+            content_x, content_y = int(xs.min()), int(ys.min())
+            content_w, content_h = int(xs.max() - content_x + 1), int(ys.max() - content_y + 1)
+
+            # COVER缩放
+            if content_w > 0 and content_h > 0 and mw > 0 and mh > 0:
+                scale = max(mw / content_w, mh / content_h)
             else:
                 scale = 1.0
 
             new_w = max(1, int(layer_img.width * scale))
             new_h = max(1, int(layer_img.height * scale))
 
-            # PSD图层在PSD中的偏移（相对于其自身边界矩形）
-            # 图层内容可能不完全填充其边界矩形
-            psd_offset_x = lx - px
-            psd_offset_y = ly - py
+            # 中心对齐
+            offset_x = int((mx + mw / 2) - (content_x + content_w / 2) * scale)
+            offset_y = int((my + mh / 2) - (content_y + content_h / 2) * scale)
 
-            # 映射到EPS坐标：在腐蚀后区域中居中放置
-            offset_x = mx + (mw - new_w) // 2
-            offset_y = my + (mh - new_h) // 2
-
-            logger.info(f"渲染图层 '{cls.layer.name}': "
-                         f"类型={cls.graphic_type}, 轮廓层={contour_idx}, "
-                         f"腐蚀={erosion_eps}px, PSD内缩={insets}, "
-                         f"缩放={scale:.4f}, 偏移=({offset_x},{offset_y})")
-
-            layer_render_data.append({
-                'layer_img': layer_img,
-                'layer_mask': layer_mask,
-                'layer_name': cls.layer.name,
-                'graphic_type': cls.graphic_type,
-                'offset_x': offset_x,
-                'offset_y': offset_y,
-                'scale': scale,
-                'new_w': new_w,
-                'new_h': new_h,
-            })
-
-        # 3. Z序合成：按面积从大到小（外层先渲染，内层后渲染）
-        # layer_render_data 已按面积排序（来自classifications）
-        for data in layer_render_data:
-            layer_img = data['layer_img']
-            layer_mask = data['layer_mask']
-            new_w = data['new_w']
-            new_h = data['new_h']
-            ox, oy = data['offset_x'], data['offset_y']
-
-            # 缩放PSD图层
+            # 渲染（仅填充，不应用描边）
             scaled_layer = layer_img.resize((new_w, new_h), Image.LANCZOS)
-
-            # 创建该层画布
             layer_canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-            layer_canvas.paste(scaled_layer, (ox, oy), scaled_layer)
+            layer_canvas.paste(scaled_layer, (offset_x, offset_y), scaled_layer)
 
-            # 用腐蚀后蒙版裁剪
+            # 蒙版裁剪
             layer_arr = np.array(layer_canvas)
-            mask_arr = np.array(layer_mask)
             mask_bin = (mask_arr > 128)
-
             for c in range(3):
                 layer_arr[:, :, c] = np.where(mask_bin, layer_arr[:, :, c], 0)
             layer_arr[:, :, 3] = np.where(mask_bin, layer_arr[:, :, 3], 0)
@@ -357,10 +389,116 @@ class DesignService:
             rendered = Image.fromarray(layer_arr, mode="RGBA")
             canvas = Image.alpha_composite(canvas, rendered)
 
-        # 4. 叠加CAD边框线
-        canvas = self._overlay_cad_border(canvas, base_img, contour_masks[0])
+            logger.info(f"渲染图层 '{cls.layer.name}': "
+                         f"类型={cls.graphic_type}, 腐蚀={erosion}px, "
+                         f"缩放={scale:.4f}, 偏移=({offset_x},{offset_y})")
+
+        # 第二遍：应用所有描边（从最外层到最内层，确保描边在图层之上）
+        for orig_idx in sorted_orig_indices:
+            if orig_idx in stroke_rings:
+                canvas = self._apply_stroke_ring(canvas, stroke_rings[orig_idx])
+
+        # 9. 叠加CAD边框线
+        canvas = self._overlay_cad_border(canvas, base_img, base_mask)
 
         return canvas.convert("RGB")
+
+    def _render_with_psd_composite(self, base_img: Image.Image,
+                                    contour_levels: List[ContourLevel],
+                                    psd_composite: Image.Image,
+                                    config: ProcessConfig) -> Image.Image:
+        """使用PSD合成图直接渲染
+
+        当PSD包含矢量智能对象等无法单独加载的图层时，
+        使用PSD合成图作为整体图案源，确保所有视觉效果正确呈现。
+
+        核心思路：
+        1. 获取PSD合成图（已包含所有图层效果、矢量智能对象、混合模式）
+        2. 使用最外层EPS轮廓作为基础蒙版
+        3. Cover模式缩放合成图适配EPS形状
+        4. 应用EPS蒙版裁剪
+        5. 叠加CAD边框线
+        """
+        w, h = base_img.size
+
+        # 使用最外层轮廓作为基础蒙版
+        if not contour_levels:
+            base_mask = Image.new("L", (w, h), 255)
+            base_rect = (0, 0, w, h)
+        else:
+            base_mask = contour_levels[0].mask
+            base_rect = contour_levels[0].bounding_rect
+
+        bx, by, bw, bh = base_rect
+
+        # PSD合成图转为RGBA
+        composite = psd_composite.convert("RGBA")
+        cw, ch = composite.size
+
+        # 计算Cover模式缩放（确保PSD填满EPS形状）
+        scale_x = bw / cw if cw > 0 else 1.0
+        scale_y = bh / ch if ch > 0 else 1.0
+        scale = max(scale_x, scale_y)
+
+        new_w = max(1, int(cw * scale))
+        new_h = max(1, int(ch * scale))
+
+        # 缩放PSD合成图
+        scaled_composite = composite.resize((new_w, new_h), Image.LANCZOS)
+
+        # 中心对齐到EPS形状
+        offset_x = int(bx + (bw - new_w) / 2)
+        offset_y = int(by + (bh - new_h) / 2)
+
+        # 合成到画布
+        canvas = Image.new("RGBA", (w, h), (255, 255, 255, 255))
+        canvas.paste(scaled_composite, (offset_x, offset_y), scaled_composite)
+
+        # 应用EPS蒙版裁剪（蒙版外保持白色背景，避免convert RGB时变黑）
+        mask_arr = np.array(base_mask)
+        mask_bin = (mask_arr > 128)
+
+        canvas_arr = np.array(canvas)
+        for c in range(3):
+            canvas_arr[:, :, c] = np.where(mask_bin, canvas_arr[:, :, c], 255)
+        canvas_arr[:, :, 3] = 255
+
+        canvas = Image.fromarray(canvas_arr, mode="RGBA")
+
+        logger.info(f"PSD合成图渲染: 缩放={scale:.4f}, 偏移=({offset_x},{offset_y}), "
+                     f"画布={w}x{h}")
+
+        # 叠加CAD边框线
+        canvas = self._overlay_cad_border(canvas, base_img, base_mask)
+
+        return canvas.convert("RGB")
+
+    def _apply_stroke_ring(self, canvas: Image.Image,
+                            stroke_ring_mask: Image.Image) -> Image.Image:
+        """应用描边环效果
+
+        在描边环区域填充深色描边。使用统一的深棕色描边色。
+        """
+        canvas_arr = np.array(canvas)
+        mask_arr = np.array(stroke_ring_mask)
+        mask_bin = (mask_arr > 128)
+
+        if not np.any(mask_bin):
+            return canvas
+
+        # 统一深棕色描边（与效果图一致）
+        stroke_color = (90, 65, 30)
+
+        stroke_arr = np.array(canvas.copy())
+        for c in range(3):
+            stroke_arr[:, :, c] = np.where(
+                mask_bin,
+                stroke_color[c],
+                canvas_arr[:, :, c]
+            )
+        stroke_arr[:, :, 3] = np.where(mask_bin, 255, canvas_arr[:, :, 3])
+
+        return Image.fromarray(stroke_arr, mode="RGBA")
 
     def _get_psd_bounds(self, classifications: List[LayerClassification]) -> Tuple[int, int, int, int]:
         """计算PSD所有图层的整体边界"""
@@ -401,11 +539,29 @@ class DesignService:
     # ---------- 辅助方法 ----------
 
     def _prepare_psd_composite(self, psd_path: Path, layers) -> Image.Image:
-        """获取PSD合成图"""
+        """获取PSD合成图
+
+        优先使用引擎已导出的完整合成图（__psd_composite__），
+        其次兼容旧版回退层，最后尝试psd-tools或单图层选择。
+        """
+        # 1. 优先使用引擎已导出的PSD完整合成图
+        for layer in layers:
+            if layer.name == "__psd_composite__":
+                logger.info(f"使用PSD完整合成图: {layer.image.width}x{layer.image.height}")
+                return layer.image.convert("RGBA")
+
+        # 2. 兼容旧版回退层
+        for layer in layers:
+            if layer.name == "__psd_composite_fallback__":
+                logger.info(f"使用已加载的PSD合成图: {layer.image.width}x{layer.image.height}")
+                return layer.image.convert("RGBA")
+
+        # 3. 尝试用psd-tools渲染完整合成图
         composite = self._render_psd_composite(psd_path)
         if composite is not None:
             return composite
 
+        # 4. 回退：选择最佳花纹图层
         best = self._select_pattern_layer(layers)
         if best is not None:
             return best

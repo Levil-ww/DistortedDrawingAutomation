@@ -82,24 +82,104 @@ class PhotoshopEngine(ImageEngine):
         doc = self._ps_app.Open(str(path))
         layers: List[LayerInfo] = []
         try:
-            for layer in doc.layers:
-                if not layer.visible or layer.typename != "ArtLayer":
+            all_layers = list(doc.layers)
+            total = len(all_layers)
+            skipped = 0
+
+            for layer in all_layers:
+                if not layer.visible:
                     continue
-                self._ps_app.activeDocument = doc
-                doc.activeLayer = layer
-                layer.copy()
-                # 粘贴到新文档再导出为PIL
-                temp_doc = self._ps_app.documents.add(
-                    doc.width, doc.height, doc.resolution, "temp", 2  # RGB
-                )
-                self._ps_app.activeDocument = temp_doc
-                pasted = temp_doc.paste()
-                img = self._doc_to_pil(temp_doc)
-                layers.append(LayerInfo(layer.name, img))
-                temp_doc.close(False)
+
+                typename = layer.typename
+                if typename not in ("ArtLayer", "SmartObjectLayer"):
+                    # 尝试其他图层类型（如文字层、调整层等）
+                    if typename not in ("TextLayer", "AdjustmentLayer"):
+                        skipped += 1
+                        continue
+
+                try:
+                    self._ps_app.activeDocument = doc
+                    doc.activeLayer = layer
+
+                    if typename == "SmartObjectLayer":
+                        # 智能对象：通过导出方式获取内容
+                        img = self._export_smart_object(doc, layer)
+                        if img:
+                            layers.append(LayerInfo(layer.name, img))
+                            logger.info(f"加载智能对象图层 '{layer.name}': {img.width}x{img.height}")
+                        else:
+                            skipped += 1
+                        continue
+
+                    # 普通图层：复制到新文档再导出
+                    layer.copy()
+                    temp_doc = self._ps_app.documents.add(
+                        doc.width, doc.height, doc.resolution, "temp", 2  # RGB
+                    )
+                    self._ps_app.activeDocument = temp_doc
+                    pasted = temp_doc.paste()
+                    img = self._doc_to_pil(temp_doc)
+                    layers.append(LayerInfo(layer.name, img))
+                    temp_doc.close(False)
+                except Exception as e:
+                    logger.warning(f"加载图层 '{layer.name}' 失败: {e}")
+                    skipped += 1
+
+            # 总是导出PSD合成图（所有可见图层的最终渲染结果）
+            try:
+                composite = self._doc_to_pil(doc)
+                if composite:
+                    if composite.mode != "RGBA":
+                        composite = composite.convert("RGBA")
+                    layers.append(LayerInfo("__psd_composite__", composite))
+                    logger.info(f"PSD合成图: {composite.width}x{composite.height}")
+            except Exception as e:
+                logger.warning(f"PSD合成图导出失败: {e}")
+
+            logger.info(f"Photoshop COM加载完成: {len(layers)} 个图层 (含合成图)")
         finally:
             doc.close(False)
         return layers
+
+    def _export_smart_object(self, doc, layer) -> Image.Image:
+        """导出智能对象图层的内容
+
+        方法：临时将该图层转为可编辑像素，导出后再还原。
+        这确保智能对象中的矢量内容被正确栅格化。
+        """
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        tmp.close()
+        try:
+            # 仅显示当前图层，导出其内容
+            self._ps_app.activeDocument = doc
+
+            # 隐藏所有图层，只保留当前智能对象
+            original_visibility = {}
+            for l in doc.layers:
+                original_visibility[l.name] = l.visible
+                l.visible = False
+            layer.visible = True
+
+            # 导出当前文档（只包含当前图层内容）
+            export_doc = self._ps_app.activeDocument
+            opt = self._ps_app.PNGSaveOptions()
+            export_doc.saveAs(tmp.name, opt, True)
+
+            # 恢复所有图层可见性
+            for l in doc.layers:
+                if l.name in original_visibility:
+                    l.visible = original_visibility[l.name]
+
+            img = Image.open(tmp.name)
+            if img.mode != "RGBA":
+                img = img.convert("RGBA")
+            return img
+        except Exception as e:
+            logger.warning(f"智能对象导出失败: {e}")
+            return None
+        finally:
+            Path(tmp.name).unlink(missing_ok=True)
 
     def save_jpg(self, image: Image.Image, path: Path, quality: int = 95) -> None:
         # 使用 Pillow 保存即可，无需经过 PS

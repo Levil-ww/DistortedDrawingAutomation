@@ -144,27 +144,86 @@ class PillowEngine(ImageEngine):
             raise RuntimeError(f"无法打开EPS文件: {e}") from e
 
     def load_psd_layers(self, path: Path) -> List[LayerInfo]:
-        """加载PSD图层"""
-        layers: List[LayerInfo] = []
+        """加载PSD图层
 
-        # 尝试psd-tools
+        支持矢量智能对象（SmartObjectLayer）和普通图层。
+        当psd-tools无法加载某些图层时，回退到使用PSD合成图。
+        """
+        layers: List[LayerInfo] = []
+        skipped_count = 0
+        total_count = 0
+
         try:
             from psd_tools import PSDImage
             psd = PSDImage.open(str(path))
+            total_count = len(list(psd))
+
             for layer in psd:
-                if layer.is_visible() and layer.has_pixels():
+                if not layer.is_visible():
+                    continue
+
+                # 处理矢量智能对象
+                if hasattr(layer, 'smart_object') and layer.smart_object is not None:
+                    try:
+                        img = layer.composite()
+                        if img:
+                            layers.append(LayerInfo(layer.name, img))
+                            logger.info(f"加载智能对象图层 '{layer.name}': {img.width}x{img.height}")
+                            continue
+                    except Exception as e:
+                        logger.warning(f"智能对象图层 '{layer.name}' composite() 失败: {e}")
+
+                    # 尝试导出智能对象内容
+                    try:
+                        import tempfile
+                        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+                        tmp.close()
+                        layer.smart_object.export(tmp.name)
+                        img = Image.open(tmp.name)
+                        img = img.convert("RGBA")
+                        Path(tmp.name).unlink(missing_ok=True)
+                        layers.append(LayerInfo(layer.name, img))
+                        logger.info(f"通过export()加载智能对象 '{layer.name}': {img.width}x{img.height}")
+                        continue
+                    except Exception as e2:
+                        logger.warning(f"智能对象图层 '{layer.name}' export() 也失败: {e2}")
+                        skipped_count += 1
+                        continue
+
+                # 普通图层
+                if layer.has_pixels():
                     img = layer.composite()
                     if img:
                         layers.append(LayerInfo(layer.name, img))
+                else:
+                    skipped_count += 1
+
+            # 总是追加PSD合成图（确保包含所有效果、智能对象的正确渲染）
+            try:
+                composite = psd.composite()
+                if composite:
+                    if composite.mode != "RGBA":
+                        composite = composite.convert("RGBA")
+                    layers.append(LayerInfo("__psd_composite__", composite))
+                    logger.info(f"PSD合成图: {composite.width}x{composite.height}")
+            except Exception as e:
+                logger.warning(f"PSD合成图导出失败: {e}")
+
             if layers:
+                logger.info(f"psd-tools加载完成: {len(layers)} 个图层 (跳过 {skipped_count})")
                 return layers
         except ImportError:
             logger.debug("psd-tools未安装")
+        except Exception as e:
+            logger.warning(f"psd-tools加载PSD图层出错: {e}")
 
         # 回退：使用目录中的PNG图层
         work_dir = path.parent
-        for png in sorted(work_dir.glob("*_000*.png")):
-            layers.append(LayerInfo(png.stem, Image.open(str(png))))
+        png_layers = sorted(work_dir.glob("*_000*.png"))
+        if png_layers:
+            layers = [LayerInfo(png.stem, Image.open(str(png))) for png in png_layers]
+            logger.info(f"从PNG回退加载: {len(layers)} 个图层")
+            return layers
 
         if not layers:
             raise RuntimeError(f"无法从 {path} 加载任何图层")
