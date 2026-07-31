@@ -268,12 +268,17 @@ class DesignAutoGUI:
     def _build_preview(self, parent):
         hdr = Frame(parent, bg="#ecf0f1", padx=10, pady=5)
         hdr.pack(fill="x")
-        Label(hdr, text="效果预览", font=("Microsoft YaHei", 12, "bold"),
+        Label(hdr, text="效果预览 (设计实际尺寸显示)", font=("Microsoft YaHei", 12, "bold"),
               bg="#ecf0f1", fg="#2c3e50").pack(side="left")
 
         self.preview_label = Label(parent, text="暂无预览\n点击「生成预览」",
-                                   bg="#ffffff", fg="#bdc3c7", font=("Microsoft YaHei", 12))
+                                   bg="#2c3e50", fg="#bdc3c7", font=("Microsoft YaHei", 12))
         self.preview_label.pack(expand=True, padx=10, pady=10)
+
+        # 尺寸标注标签
+        self.size_label = Label(parent, text="", bg="#ffffff", fg="#7f8c8d",
+                                font=("Microsoft YaHei", 10))
+        self.size_label.pack(side="bottom", pady=(0, 10))
 
     def _build_log(self, parent):
         hdr = Frame(parent, bg="#ecf0f1", padx=10, pady=5)
@@ -425,8 +430,15 @@ class DesignAutoGUI:
                 self.engine_var.set(f"引擎: {engine.capabilities.name}")
 
                 service = self._container.create_service()
-                img = service.generate_preview(cfg, max_width=400)
-                self._log(f"预览图生成: {img.width}x{img.height}, 模式={img.mode}")
+
+                # 解析EPS尺寸用于日志
+                eps_size = service._resolve_canvas_size(Path(cfg.eps_file), cfg)
+                eps_w_cm, eps_h_cm = eps_size
+                self._log(f"画布尺寸: {eps_w_cm:.1f} x {eps_h_cm:.1f} cm")
+
+                # 生成预览（使用20cm最大显示宽度）
+                img = service.generate_preview(cfg, max_width_cm=15.0)
+                self._log(f"预览图生成: {img.width}x{img.height}px")
 
                 if img.width < 10 or img.height < 10:
                     self._log(f"警告: 预览图尺寸异常({img.width}x{img.height})，可能是EPS无法栅格化")
@@ -435,14 +447,23 @@ class DesignAutoGUI:
                 if img.width <= 0 or img.height <= 0:
                     img = Image.new("RGB", (400, 300), "white")
 
-                max_w, max_h = 380, 300
+                # 适配预览区域显示
+                max_w, max_h = 460, 360
                 ratio = min(max_w / img.width, max_h / img.height)
                 ratio = max(ratio, 0.01)
-                img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
+                display_w = int(img.width * ratio)
+                display_h = int(img.height * ratio)
+                img = img.resize((display_w, display_h), Image.LANCZOS)
 
+                # 更新预览图和尺寸标签
+                eps_label = f"设计实际尺寸: {eps_w_cm:.1f} × {eps_h_cm:.1f} cm"
                 self.root.after(0, lambda: self._show_image(img))
+                self.root.after(0, lambda: self.size_label.config(text=eps_label))
                 self.root.after(0, lambda: self.status_var.set("预览就绪"))
-                self.root.after(0, lambda: self._log(f"预览生成完成 ({img.width}x{img.height})"))
+                self.root.after(0, lambda: self._log(
+                    f"预览完成 ({display_w}x{display_h}px, "
+                    f"设计尺寸 {eps_w_cm:.1f}x{eps_h_cm:.1f}cm)"
+                ))
             except Exception as e:
                 import traceback
                 err = traceback.format_exc()
@@ -459,7 +480,7 @@ class DesignAutoGUI:
         self.preview_label.config(
             image=self.preview_photo,
             text="",
-            bg="#ffffff",
+            bg="#2c3e50",
             compound="center"
         )
         self.preview_label.update_idletasks()

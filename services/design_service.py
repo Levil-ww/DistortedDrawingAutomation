@@ -160,25 +160,33 @@ class DesignService:
 
         return out_path
 
-    def generate_preview(self, config: ProcessConfig, max_width: int = 400) -> Image.Image:
-        """生成预览图（复刻 process 流程，使用低DPI + 缩放显示）"""
-        preview_dpi = min(config.dpi, 72)
-        logger.info(f"生成预览: EPS @ {preview_dpi}dpi, 目标宽度 {max_width}px")
+    def generate_preview(self, config: ProcessConfig, max_width_cm: float = 15.0) -> Image.Image:
+        """生成预览图
+
+        使用中等DPI栅格化EPS，高分辨率加载PSD，合成后缩放到显示尺寸。
+        max_width_cm: 预览在GUI中显示的最大宽度（厘米），用于确定显示缩放
+        """
+        # 预览用中等DPI（平衡质量和速度）
+        preview_dpi = 150
+        logger.info(f"生成预览: EPS @ {preview_dpi}dpi")
 
         eps_path = Path(config.eps_file)
         width_cm, height_cm = self._resolve_canvas_size(eps_path, config)
 
-        # 1. 栅格化 EPS
+        # 1. 栅格化 EPS（中等DPI）
         base = self.engine.open_eps(
             eps_path, dpi=preview_dpi,
             width_cm=width_cm,
             height_cm=height_cm,
         )
 
+        w_px, h_px = base.size
+        logger.info(f"EPS栅格化: {w_px}x{h_px}px ({width_cm}x{height_cm}cm @ {preview_dpi}dpi)")
+
         # 2. 提取轮廓
         contour_levels = self.contour_extractor.extract_contours(base, num_levels=5)
 
-        # 3. 加载PSD
+        # 3. 加载PSD（PSD以原生分辨率加载，保持高质量）
         psd_path = Path(config.psd_file)
         psd_layers = self.engine.load_psd_layers(psd_path)
         if not psd_layers:
@@ -207,11 +215,20 @@ class DesignService:
             warmth=config.warmth,
         )
 
-        # 6. 缩放到显示尺寸
-        if result.width > max_width:
-            ratio = max_width / result.width
-            display_size = (max_width, int(result.height * ratio))
-            result = result.resize(display_size, Image.LANCZOS)
+        # 6. 缩放到GUI显示尺寸（以厘米为单位）
+        display_dpi = 96  # 屏幕显示DPI (1cm ≈ 37.8px)
+        target_width_px = int(max_width_cm / 2.54 * display_dpi)
+        target_height_px = int(target_width_px * height_cm / width_cm)
+
+        if result.width > target_width_px:
+            ratio = target_width_px / result.width
+            result = result.resize((target_width_px, int(result.height * ratio)), Image.LANCZOS)
+
+        disp_w_cm = result.width / display_dpi * 2.54
+        disp_h_cm = result.height / display_dpi * 2.54
+        logger.info(f"预览生成: {result.width}x{result.height}px "
+                     f"(显示约 {disp_w_cm:.1f}x{disp_h_cm:.1f}cm, "
+                     f"实际 {width_cm:.1f}x{height_cm:.1f}cm)")
 
         return result
 
@@ -409,19 +426,12 @@ class DesignService:
                                     config: ProcessConfig) -> Image.Image:
         """使用PSD合成图直接渲染
 
-        当PSD包含矢量智能对象等无法单独加载的图层时，
-        使用PSD合成图作为整体图案源，确保所有视觉效果正确呈现。
-
-        核心思路：
-        1. 获取PSD合成图（已包含所有图层效果、矢量智能对象、混合模式）
-        2. 使用最外层EPS轮廓作为基础蒙版
-        3. Cover模式缩放合成图适配EPS形状
-        4. 应用EPS蒙版裁剪
-        5. 叠加CAD边框线
+        使用独立X/Y缩放将PSD设计适配到EPS形状，确保完整填充无裁切。
+        叠加CAD边框线后完成渲染。
         """
         w, h = base_img.size
 
-        # 使用最外层轮廓作为基础蒙版
+        # 使用最外层轮廓作为基础蒙版和边界
         if not contour_levels:
             base_mask = Image.new("L", (w, h), 255)
             base_rect = (0, 0, w, h)
@@ -435,26 +445,28 @@ class DesignService:
         composite = psd_composite.convert("RGBA")
         cw, ch = composite.size
 
-        # 计算Cover模式缩放（确保PSD填满EPS形状）
+        # 独立计算X/Y缩放比（精确适配EPS形状，不保持比例）
         scale_x = bw / cw if cw > 0 else 1.0
         scale_y = bh / ch if ch > 0 else 1.0
-        scale = max(scale_x, scale_y)
 
-        new_w = max(1, int(cw * scale))
-        new_h = max(1, int(ch * scale))
+        new_w = max(1, int(cw * scale_x))
+        new_h = max(1, int(ch * scale_y))
 
-        # 缩放PSD合成图
+        logger.info(f"PSD适配: PSD尺寸={cw}x{ch}, EPS边界={bw}x{bh}, "
+                     f"缩放X={scale_x:.4f}, Y={scale_y:.4f}")
+
+        # 使用独立X/Y缩放将PSD精确适配到EPS形状
         scaled_composite = composite.resize((new_w, new_h), Image.LANCZOS)
 
-        # 中心对齐到EPS形状
-        offset_x = int(bx + (bw - new_w) / 2)
-        offset_y = int(by + (bh - new_h) / 2)
+        # 对齐到EPS边界起点
+        offset_x = int(bx)
+        offset_y = int(by)
 
-        # 合成到画布
+        # 创建白色画布，合成PSD
         canvas = Image.new("RGBA", (w, h), (255, 255, 255, 255))
         canvas.paste(scaled_composite, (offset_x, offset_y), scaled_composite)
 
-        # 应用EPS蒙版裁剪（蒙版外保持白色背景，避免convert RGB时变黑）
+        # 应用EPS蒙版裁剪（蒙版外保持白色背景）
         mask_arr = np.array(base_mask)
         mask_bin = (mask_arr > 128)
 
@@ -465,7 +477,7 @@ class DesignService:
 
         canvas = Image.fromarray(canvas_arr, mode="RGBA")
 
-        logger.info(f"PSD合成图渲染: 缩放={scale:.4f}, 偏移=({offset_x},{offset_y}), "
+        logger.info(f"PSD合成图渲染: 尺寸={new_w}x{new_h}, 偏移=({offset_x},{offset_y}), "
                      f"画布={w}x{h}")
 
         # 叠加CAD边框线

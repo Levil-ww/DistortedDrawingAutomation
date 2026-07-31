@@ -28,7 +28,7 @@ print(f'Canvas size: {w:.1f} x {h:.1f} cm')
 
 # 生成预览
 print('\n=== Generating Preview ===')
-preview = service.generate_preview(cfg, max_width=600)
+preview = service.generate_preview(cfg, max_width_cm=15.0)
 print(f'Preview: {preview.width}x{preview.height}')
 
 # 检查留白
