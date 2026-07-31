@@ -1,0 +1,189 @@
+================================================================================
+              异形设计自动化工具 - 2026年07月31日 修复说明
+================================================================================
+
+本文件记录了 2026-07-31 当天所有提问、修复任务及其子问题，按任务顺序排列。
+核心目标：解决预览图与期望效果图不一致的问题，并统一使用厘米单位显示尺寸。
+
+
+================================================================================
+一、矢量智能对象（花纹、点状装饰边）未显示
+================================================================================
+
+问题：PSD中的矢量智能对象（SmartObjectLayer）在加载时被直接跳过，
+导致花纹和点状装饰边等关键视觉元素在预览图中完全缺失。
+另外存在图层依赖关系：花纹矢量对象可见时，"矩形1"图层也必须可见，
+单独处理图层会破坏这种依赖。
+
+1. PillowEngine 增加智能对象支持
+   文件: engines/pillow_engine.py (第145-217行)
+   - load_psd_layers() 新增对 SmartObjectLayer 的处理分支
+   - 优先使用 layer.composite() 渲染智能对象内容
+   - 若 composite() 失败，回退到 layer.smart_object.export() 导出原始内容
+   - 双重保障确保矢量智能对象内容被正确加载
+
+2. PhotoshopEngine 增加智能对象支持
+   文件: engines/photoshop_engine.py (第80-140行)
+   - load_psd_layers() 新增 typename == "SmartObjectLayer" 判断分支
+   - 通过 _export_smart_object() 导出智能对象内容
+   - 兼容 COM 接口的智能对象操作方式
+
+3. 图层依赖关系处理
+   - 不再单独逐层渲染，改为使用 PSD 整体合成图
+   - 通过 psd.composite() 一次性渲染所有可见图层
+   - 天然保留图层间的可见性依赖和混合模式
+
+修复效果：花纹和点状装饰边在预览图中正确显示，图层依赖关系自动满足。
+
+
+================================================================================
+二、图层效果丢失（描边、颜色叠加）
+================================================================================
+
+问题：即使智能对象加载成功，预览图仍缺少图层样式效果（描边、颜色叠加等），
+与期望效果图存在明显差异。
+
+1. 根本原因
+   - 逐层加载时，psd-tools 的 layer.composite() 不包含图层样式效果
+   - 描边、阴影、颜色叠加等效果需要 Photoshop 完整渲染引擎才能正确呈现
+
+2. PSD合成图渲染路径
+   文件: engines/pillow_engine.py (第200-209行)
+   文件: engines/photoshop_engine.py (第127-137行)
+   - 两个引擎均追加 __psd_composite__ 图层
+   - PillowEngine: 使用 psd.composite() 获取完整合成图
+   - PhotoshopEngine: 使用 _doc_to_pil(doc) 导出文档完整渲染
+   - 合成图包含所有图层效果、矢量内容、混合模式的最终呈现
+
+3. 渲染策略调整
+   文件: services/design_service.py (第197-205行)
+   - generate_preview() 中优先使用 PSD 合成图整体渲染
+   - 移除 has_composite_fallback 条件判断，总是优先走合成图路径
+   - 当 psd_composite 存在时调用 _render_with_psd_composite()
+   - 否则回退到 _render_multi_layer() 多层渲染
+
+修复效果：描边、颜色叠加等图层样式效果在预览图中正确呈现。
+
+
+================================================================================
+三、蒙版外区域变黑
+================================================================================
+
+问题：在 _render_with_psd_composite() 中，RGBA 转 RGB 时蒙版外区域
+（透明像素）被渲染为黑色，导致预览图边缘出现黑框。
+
+1. 根本原因
+   - PSD合成图包含Alpha通道，蒙版外区域为透明(RGBA的A=0)
+   - 直接 convert("RGB") 时，透明像素的RGB值被解释为(0,0,0)即黑色
+
+2. 修复方案
+   文件: services/design_service.py (_render_with_psd_composite 方法)
+   - 使用 NumPy 数组操作，按蒙版逐像素处理
+   - 蒙版内区域（mask_bin=True）：保留PSD合成内容
+   - 蒙版外区域（mask_bin=False）：强制设为白色(255,255,255)
+   - Alpha通道统一设为255（完全不透明）
+
+   核心代码:
+   mask_arr = np.array(base_mask)
+   mask_bin = (mask_arr > 128)
+   canvas_arr = np.array(canvas)
+   for c in range(3):
+       canvas_arr[:, :, c] = np.where(mask_bin, canvas_arr[:, :, c], 255)
+   canvas_arr[:, :, 3] = 255
+
+修复效果：蒙版外区域正确显示为白色背景，无黑框现象。
+
+
+================================================================================
+四、PSD适配方式错误（COVER裁切导致内容缺失）
+================================================================================
+
+问题：PSD合成图与EPS形状的宽高比不同（PSD约1.75，EPS约1.86），
+使用 COVER 模式（max(scale_x, scale_y)）缩放时，较长边会被裁切，
+导致预览图部分内容丢失，与期望效果图不一致。
+
+1. 原实现（COVER模式）
+   文件: services/design_service.py
+   - scale = max(scale_x, scale_y)  → 取较大缩放比
+   - 中心对齐: offset = bx + (bw - new_w) / 2
+   - 问题：较短方向超出边界被裁切，内容不完整
+
+2. 修复：独立X/Y缩放精确适配
+   文件: services/design_service.py (_render_with_psd_composite 方法, 第448-463行)
+   - scale_x = bw / cw  → X方向独立缩放
+   - scale_y = bh / ch  → Y方向独立缩放
+   - new_w = cw * scale_x, new_h = ch * scale_y
+   - 对齐到EPS边界起点: offset_x = bx, offset_y = by
+   - PSD被精确拉伸适配到EPS形状，无裁切无留白
+
+3. 日志增强
+   - 新增 PSD适配日志：记录PSD尺寸、EPS边界、X/Y缩放比
+   - 便于排查比例不匹配问题
+
+修复效果：PSD设计完整填充EPS形状，无内容裁切，与期望效果图一致。
+
+
+================================================================================
+五、预览图尺寸与EPS要求不符（统一厘米单位）
+================================================================================
+
+问题：预览图使用固定像素尺寸生成，未与EPS要求的物理尺寸对应，
+用户无法直观了解设计的实际大小。尺寸单位混用像素和厘米，显示混乱。
+
+1. 预览DPI提升
+   文件: services/design_service.py (第169行)
+   - preview_dpi 从 72 提升到 150
+   - 平衡预览质量和渲染速度
+   - 150dpi下80cm×150cm的EPS栅格化为4724×8858px，清晰度充足
+
+2. 预览尺寸以厘米为基准计算
+   文件: services/design_service.py (第218-231行)
+   - 使用 display_dpi=96 计算屏幕显示像素
+   - target_width_px = max_width_cm / 2.54 * display_dpi
+   - target_height_px 按EPS宽高比等比计算
+   - 日志同时输出显示尺寸和实际EPS尺寸（厘米）
+
+3. GUI显示厘米单位
+   文件: gui/app.py (第434-466行)
+   - 预览区域标题改为"效果预览 (设计实际尺寸显示)"
+   - 新增 size_label 尺寸标注标签
+   - 显示格式: "设计实际尺寸: 151.2 × 81.2 cm"
+   - 日志输出: "预览完成 (460x360px, 设计尺寸 151.2x81.2cm)"
+   - 预览背景改为深色(#2c3e50)，与期望效果图风格一致
+
+4. 测试脚本同步更新
+   文件: Test/_test_psd_size.py (第31行)
+   - generate_preview 调用签名从 max_width=600 改为 max_width_cm=15.0
+
+修复效果：预览图尺寸与EPS物理尺寸对应，统一使用厘米单位显示。
+
+
+================================================================================
+附：修改文件清单
+================================================================================
+
+1. engines/pillow_engine.py
+   - 修改 load_psd_layers()       — 新增SmartObjectLayer处理分支
+   - 新增智能对象双重加载          — composite() + export()回退
+   - 新增 __psd_composite__ 图层   — 总是追加PSD完整合成图
+
+2. engines/photoshop_engine.py
+   - 修改 load_psd_layers()       — 新增SmartObjectLayer类型判断
+   - 新增 _export_smart_object()  — 智能对象导出
+   - 新增 __psd_composite__ 图层   — 总是导出PSD完整合成图
+
+3. services/design_service.py
+   - 修改 generate_preview()      — preview_dpi 72→150, 厘米单位计算
+   - 修改 _render_with_psd_composite() — COVER裁切→独立X/Y缩放精确适配
+   - 修复蒙版外区域变黑            — NumPy逐像素处理，蒙版外填白色
+   - 移除 has_composite_fallback   — 总是优先使用PSD合成图渲染
+
+4. gui/app.py
+   - 修改 _build_preview()        — 新增size_label尺寸标注标签
+   - 修改 _show_image()           — 预览背景改为深色
+   - 修改 _on_preview()           — 厘米单位显示，EPS实际尺寸标注
+
+5. Test/_test_psd_size.py
+   - 修改 generate_preview 调用   — 适配新签名 max_width_cm
+
+================================================================================
