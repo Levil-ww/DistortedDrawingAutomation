@@ -168,7 +168,7 @@ class DesignService:
         """
         # 预览用中等DPI（平衡质量和速度）
         preview_dpi = 150
-        logger.info(f"生成预览: EPS @ {preview_dpi}dpi")
+        logger.info(f"=== 开始生成预览: EPS @ {preview_dpi}dpi ===")
 
         eps_path = Path(config.eps_file)
         width_cm, height_cm = self._resolve_canvas_size(eps_path, config)
@@ -181,10 +181,19 @@ class DesignService:
         )
 
         w_px, h_px = base.size
-        logger.info(f"EPS栅格化: {w_px}x{h_px}px ({width_cm}x{height_cm}cm @ {preview_dpi}dpi)")
+        logger.info(f"[Step1] EPS栅格化: {w_px}x{h_px}px ({width_cm}x{height_cm}cm @ {preview_dpi}dpi)")
 
         # 2. 提取轮廓
+        logger.info(f"[Step2] 开始提取轮廓 (num_levels=5) ...")
         contour_levels = self.contour_extractor.extract_contours(base, num_levels=5)
+        if contour_levels:
+            top = contour_levels[0]
+            tx, ty, tw, th = top.bounding_rect
+            sol = top.area / max(tw * th, 1)
+            logger.info(f"[Step2] 轮廓提取完成: {len(contour_levels)}层, "
+                        f"第0层 area={top.area}, rect=({tx},{ty},{tw},{th}), solidity={sol:.3f}")
+        else:
+            logger.warning("[Step2] 未提取到任何轮廓！")
 
         # 3. 加载PSD（PSD以原生分辨率加载，保持高质量）
         psd_path = Path(config.psd_file)
@@ -193,17 +202,22 @@ class DesignService:
             raise RuntimeError("无可用图层")
 
         psd_composite = self._prepare_psd_composite(psd_path, psd_layers)
+        logger.info(f"[Step3] 素材加载完成: {psd_path.suffix}, "
+                    f"psd_composite={psd_composite.size if psd_composite else None}")
         classifications = self.layer_classifier.classify_layers(psd_layers, psd_composite)
 
         # 4. 多层渲染（优先使用PSD合成图整体渲染）
         if psd_composite:
+            logger.info("[Step4] 使用 _render_with_psd_composite 路径")
             result = self._render_with_psd_composite(
                 base, contour_levels, psd_composite, config
             )
         else:
+            logger.info("[Step4] 使用 _render_multi_layer 路径")
             result = self._render_multi_layer(
                 base, contour_levels, classifications, psd_composite, config
             )
+        logger.info(f"[Step4] 渲染完成: {result.size}")
 
         # 5. 色彩调整
         result = self.color_adjuster.adjust(
@@ -214,6 +228,7 @@ class DesignService:
             hue_shift=config.hue_shift,
             warmth=config.warmth,
         )
+        logger.info(f"[Step5] 色彩调整完成")
 
         # 6. 缩放到GUI显示尺寸（以厘米为单位）
         display_dpi = 96  # 屏幕显示DPI (1cm ≈ 37.8px)
@@ -226,7 +241,7 @@ class DesignService:
 
         disp_w_cm = result.width / display_dpi * 2.54
         disp_h_cm = result.height / display_dpi * 2.54
-        logger.info(f"预览生成: {result.width}x{result.height}px "
+        logger.info(f"[Step6] 预览生成: {result.width}x{result.height}px "
                      f"(显示约 {disp_w_cm:.1f}x{disp_h_cm:.1f}cm, "
                      f"实际 {width_cm:.1f}x{height_cm:.1f}cm)")
 
@@ -246,7 +261,7 @@ class DesignService:
         2. 按PSD图层内缩距离从小到大排序
         3. 为每层计算腐蚀值（确保层间有足够间距）
         4. 每层蒙版 = 基础蒙版腐蚀(腐蚀值)
-        5. 描边 = 相邻两层蒙版的差集（统一深棕色）
+        5. 描边 = 相邻两层蒙版的差集（统一米黄色）
         6. Z序合成：最外层先渲染，内层后渲染覆盖
         """
         w, h = base_img.size
@@ -323,7 +338,7 @@ class DesignService:
                 mask = base_mask.copy()
             layer_masks[orig_idx] = mask
 
-        # 7. 计算描边环（统一深棕色描边）
+        # 7. 计算描边环（统一米黄色描边）
         stroke_rings = {}
         sorted_orig_indices = [idx for idx, _ in final_erosions]
 
@@ -415,7 +430,12 @@ class DesignService:
             if orig_idx in stroke_rings:
                 canvas = self._apply_stroke_ring(canvas, stroke_rings[orig_idx])
 
-        # 9. 叠加CAD边框线
+        # ★ 生成同心边框（跟随EPS轮廓，等比例缩放内层边框）
+        canvas = self._generate_concentric_borders(
+            canvas, base_mask, base_img, config
+        )
+
+        # 叠加CAD边框线
         canvas = self._overlay_cad_border(canvas, base_img, base_mask)
 
         return canvas.convert("RGB")
@@ -424,41 +444,158 @@ class DesignService:
                                     contour_levels: List[ContourLevel],
                                     psd_composite: Image.Image,
                                     config: ProcessConfig) -> Image.Image:
-        """使用PSD合成图直接渲染
+        """使用PSD合成图直接渲染（v3：带结果校验+多轮fallback）
 
-        使用独立X/Y缩放将PSD设计适配到EPS形状，确保完整填充无裁切。
-        叠加CAD边框线后完成渲染。
+        主流程：独立X/Y缩放将PSD适配到EPS形状，用蒙版裁剪，叠加CAD边框。
+        校验：若渲染结果中心区域几乎全白，说明蒙版选错/反了 → 依次fallback：
+          1) 使用第2层轮廓 (levels[1])
+          2) 反转蒙版 (mask_inv)
+          3) 调用泛洪法重算蒙版 (ContourExtractor._extract_by_flood_fill)
         """
         w, h = base_img.size
 
-        # 使用最外层轮廓作为基础蒙版和边界
-        if not contour_levels:
-            base_mask = Image.new("L", (w, h), 255)
-            base_rect = (0, 0, w, h)
-        else:
-            base_mask = contour_levels[0].mask
-            base_rect = contour_levels[0].bounding_rect
+        # 准备"基础蒙版+边界"的候选列表
+        mask_candidates = []  # 每项: (desc, mask_img, bounding_rect)
 
-        bx, by, bw, bh = base_rect
+        # 候选0: 最外层轮廓（原默认逻辑）
+        if contour_levels:
+            l0 = contour_levels[0]
+            mask_candidates.append(("levels[0]（默认最外层轮廓）", l0.mask, l0.bounding_rect))
+
+        # 候选1: 第2层轮廓 (如果存在)
+        if len(contour_levels) >= 2:
+            l1 = contour_levels[1]
+            # 只在第2层面积足够大时考虑 (>40% 第0层)
+            if l1.area > l0.area * 0.40:
+                mask_candidates.append(("levels[1]（内层轮廓，可能是成品线）",
+                                        l1.mask, l1.bounding_rect))
+
+        # 候选2: 反转第0层蒙版 (防止里外搞反)
+        if contour_levels:
+            inv_mask = Image.fromarray(
+                255 - np.array(l0.mask), mode="L"
+            )
+            # 计算反转后蒙版的 bounding_rect 和 area
+            inv_arr = np.array(inv_mask)
+            ys, xs = np.where(inv_arr > 128)
+            if len(xs) > 0:
+                ix, iy = int(xs.min()), int(ys.min())
+                iw, ih = int(xs.max() - ix + 1), int(ys.max() - iy + 1)
+                iarea = int(np.sum(inv_arr > 128))
+                # 反转后面积也要合理（不能是整个画布的99%也不能<3%）
+                total = w * h
+                if 0.03 * total < iarea < 0.99 * total:
+                    mask_candidates.append((
+                        f"反转levels[0]蒙版（面积={iarea}）",
+                        inv_mask, (ix, iy, iw, ih)
+                    ))
+
+        # 候选3: 泛洪法直接重算（独立于原contour_levels结果）
+        try:
+            flood = self.contour_extractor._extract_by_flood_fill(base_img)
+            if flood is not None:
+                mask_candidates.append((
+                    f"泛洪法蒙版（FloodFill, 面积={flood.area}）",
+                    flood.mask, flood.bounding_rect
+                ))
+        except Exception as e:
+            logger.debug(f"泛洪法候选失败: {e}")
+
+        logger.info(f"渲染蒙版候选: {len(mask_candidates)} 个")
+        for i, (desc, m, r) in enumerate(mask_candidates):
+            b = r
+            sol = b[2] * b[3]
+            logger.info(f"  [{i}] {desc}: rect({b[0]},{b[1]},{b[2]},{b[3]})")
+
+        # 依次尝试每个蒙版候选
+        for idx, (desc, mask, rect) in enumerate(mask_candidates):
+            rendered = self._do_render_psd_with_mask(
+                base_img, psd_composite, mask, rect, config
+            )
+            # 校验：中心10%区域是否>95%白色（"白屏"特征）
+            white_ratio = self._center_white_ratio(rendered, radius=0.10)
+            if white_ratio <= 0.95:
+                logger.info(f"采用蒙版[{idx}] {desc} （中心白色占比={white_ratio:.2%}，合理）")
+                return rendered
+            else:
+                logger.warning(
+                    f"蒙版[{idx}] {desc} 渲染疑似失败：中心白色占比={white_ratio:.2%}，尝试下一个"
+                )
+
+        # 所有候选都失败，返回最后一个（至少比报错好）
+        logger.warning("所有蒙版候选的中心都呈白色，使用默认第一个作为兜底")
+        return self._do_render_psd_with_mask(
+            base_img, psd_composite,
+            mask_candidates[0][1] if mask_candidates else Image.new("L", (w, h), 255),
+            mask_candidates[0][2] if mask_candidates else (0, 0, w, h),
+            config,
+        )
+
+    def _do_render_psd_with_mask(self, base_img: Image.Image,
+                                  psd_composite: Image.Image,
+                                  mask: Image.Image,
+                                  bounding_rect: Tuple[int, int, int, int],
+                                  config: ProcessConfig) -> Image.Image:
+        """核心渲染：指定蒙版+边界，缩放PSD合成图，裁剪，叠加细线边框。
+
+        优化v6：
+        - 生成多层同心细线边框（米黄色，跟随EPS轮廓）
+        - CAD边框只在轮廓边界区域绘制，排除设计元素内部深色
+        """
+        w, h = base_img.size
+        bx, by, bw, bh = bounding_rect
+
+        # 验证蒙版有效性
+        mask_arr_check = np.array(mask)
+        mask_white_count = np.sum(mask_arr_check > 128)
+        mask_total = w * h
+        mask_ratio = mask_white_count / mask_total
+        logger.info(f"蒙版检查: 白色像素={mask_white_count} ({mask_ratio*100:.1f}%), "
+                     f"rect=({bx},{by},{bw},{bh})")
+
+        # 如果蒙版几乎全黑（<1%白色），可能导致结果空白
+        if mask_ratio < 0.01:
+            logger.warning(f"蒙版几乎全黑({mask_ratio*100:.2f}%)，可能导致空白结果。尝试反转蒙版")
+            mask_arr_check = 255 - mask_arr_check
+            mask_white_count = np.sum(mask_arr_check > 128)
+            mask_ratio = mask_white_count / mask_total
+            logger.info(f"  反转后: 白色像素={mask_white_count} ({mask_ratio*100:.1f}%)")
+            if mask_ratio >= 0.01:
+                mask = Image.fromarray(mask_arr_check, mode="L")
+                # 重新计算bounding_rect
+                ys, xs = np.where(mask_arr_check > 128)
+                if len(xs) > 0:
+                    bx, by = int(xs.min()), int(ys.min())
+                    bw, bh = int(xs.max() - bx + 1), int(ys.max() - by + 1)
 
         # PSD合成图转为RGBA
         composite = psd_composite.convert("RGBA")
         cw, ch = composite.size
 
+        logger.info(f"PSD合成图: {cw}x{ch}px")
+
         # 独立计算X/Y缩放比（精确适配EPS形状，不保持比例）
         scale_x = bw / cw if cw > 0 else 1.0
         scale_y = bh / ch if ch > 0 else 1.0
 
+        # 边界保护：缩放比例限制在合理范围
+        max_scale = 20.0
+        scale_x = min(scale_x, max_scale)
+        scale_y = min(scale_y, max_scale)
+        min_scale = 0.05
+        scale_x = max(scale_x, min_scale)
+        scale_y = max(scale_y, min_scale)
+
         new_w = max(1, int(cw * scale_x))
         new_h = max(1, int(ch * scale_y))
 
-        logger.info(f"PSD适配: PSD尺寸={cw}x{ch}, EPS边界={bw}x{bh}, "
-                     f"缩放X={scale_x:.4f}, Y={scale_y:.4f}")
+        logger.info(f"PSD适配: PSD={cw}x{ch}, 蒙版rect={bw}x{bh}, "
+                     f"缩放X={scale_x:.4f}, Y={scale_y:.4f} -> {new_w}x{new_h}")
 
         # 使用独立X/Y缩放将PSD精确适配到EPS形状
         scaled_composite = composite.resize((new_w, new_h), Image.LANCZOS)
 
-        # 对齐到EPS边界起点
+        # 对齐到EPS边界起点 (bounding_rect的左上角)
         offset_x = int(bx)
         offset_y = int(by)
 
@@ -466,8 +603,8 @@ class DesignService:
         canvas = Image.new("RGBA", (w, h), (255, 255, 255, 255))
         canvas.paste(scaled_composite, (offset_x, offset_y), scaled_composite)
 
-        # 应用EPS蒙版裁剪（蒙版外保持白色背景）
-        mask_arr = np.array(base_mask)
+        # 应用蒙版裁剪（蒙版外保持白色背景）
+        mask_arr = np.array(mask)
         mask_bin = (mask_arr > 128)
 
         canvas_arr = np.array(canvas)
@@ -477,19 +614,45 @@ class DesignService:
 
         canvas = Image.fromarray(canvas_arr, mode="RGBA")
 
-        logger.info(f"PSD合成图渲染: 尺寸={new_w}x{new_h}, 偏移=({offset_x},{offset_y}), "
-                     f"画布={w}x{h}")
+        # ★ 生成多层同心边框（跟随EPS轮廓形状）
+        canvas = self._generate_concentric_borders(
+            canvas, mask, base_img, config
+        )
 
-        # 叠加CAD边框线
-        canvas = self._overlay_cad_border(canvas, base_img, base_mask)
+        # 叠加CAD边框线（在最上层）
+        canvas = self._overlay_cad_border(canvas, base_img, mask)
+
+        # 验证渲染结果
+        result_arr = np.array(canvas.convert("RGB"))
+        non_white = np.sum(np.any(result_arr < 250, axis=2))
+        total_pixels = w * h
+        logger.info(f"渲染结果: 非白色像素={non_white} ({non_white/total_pixels*100:.1f}%)")
 
         return canvas.convert("RGB")
+
+    def _center_white_ratio(self, img: Image.Image, radius: float = 0.10) -> float:
+        """计算图像中心区域（边长=radius*2 的正方形）中白色像素的占比。
+
+        用于检测"蒙版选错/反导致白屏"的典型症状。
+        返回值: 0~1，越大表示越白；>0.95基本就是白屏失败。
+        """
+        arr = np.array(img.convert("RGB"))
+        h, w = arr.shape[:2]
+        cx, cy = w // 2, h // 2
+        rx = max(3, int(w * radius))
+        ry = max(3, int(h * radius))
+        region = arr[cy - ry:cy + ry, cx - rx:cx + rx, :]
+        if region.size == 0:
+            return 0.0
+        # 白色判定：RGB三个通道都>=250
+        is_white = np.all(region >= 250, axis=-1)
+        return float(is_white.sum()) / float(is_white.size)
 
     def _apply_stroke_ring(self, canvas: Image.Image,
                             stroke_ring_mask: Image.Image) -> Image.Image:
         """应用描边环效果
 
-        在描边环区域填充深色描边。使用统一的深棕色描边色。
+        在描边环区域填充细线描边。使用统一的米黄色调。
         """
         canvas_arr = np.array(canvas)
         mask_arr = np.array(stroke_ring_mask)
@@ -498,8 +661,8 @@ class DesignService:
         if not np.any(mask_bin):
             return canvas
 
-        # 统一深棕色描边（与效果图一致）
-        stroke_color = (90, 65, 30)
+        # 统一米黄色描边（与设计风格一致）
+        stroke_color = (205, 188, 148)
 
         stroke_arr = np.array(canvas.copy())
         for c in range(3):
@@ -626,28 +789,154 @@ class DesignService:
                               contour_mask: Image.Image) -> Image.Image:
         """叠加CAD边框线
 
-        从base中提取深色像素（CAD线稿），叠加在渲染结果上层
-        边框线自然跟随EPS外轮廓的弧度
+        从base中提取深色像素（CAD线稿），叠加在渲染结果上层。
+        边框线自然跟随EPS外轮廓的弧度。
+
+        增强v3：只在蒙版边界区域绘制CAD线稿，排除设计元素内部的深色区域。
+        通过腐蚀蒙版创建"边界环"，只在环内绘制CAD线条。
         """
+        import numpy as np
+
         base_arr = np.array(base_img.convert("RGBA"))
         canvas_arr = np.array(canvas)
         mask_arr = np.array(contour_mask)
         mask_bin = (mask_arr > 128)
 
+        # 创建"边界环"区域：原蒙版 - 腐蚀后的蒙版
+        # 这样只在轮廓边界附近绘制CAD线稿
+        edge_width = max(3, int(min(base_img.width, base_img.height) * 0.005))
+        eroded_mask = self.contour_extractor.erode_mask(contour_mask, edge_width)
+        eroded_arr = np.array(eroded_mask)
+        eroded_bin = (eroded_arr > 128)
+
+        # 边界区域 = 在原蒙版内但不在腐蚀后蒙版内
+        boundary_zone = mask_bin & (~eroded_bin)
+
         # 检测base中的深色像素（CAD线稿）
-        is_dark = np.any(base_arr[:, :, :3] < 120, axis=2)
-        is_border = is_dark & mask_bin
+        # 高阈值(80)确保只捕获真正的深色线条
+        is_dark = np.any(base_arr[:, :, :3] < 80, axis=2)
+
+        # 边框 = 深色像素 AND 在边界区域内
+        is_border = is_dark & boundary_zone
+
+        # 如果边界像素太少，回退：扩大边界区域和阈值
+        if np.sum(is_border) < 20:
+            # 回退1：扩大边界宽度
+            edge_width2 = edge_width * 3
+            eroded_mask2 = self.contour_extractor.erode_mask(contour_mask, edge_width2)
+            eroded_arr2 = np.array(eroded_mask2)
+            eroded_bin2 = (eroded_arr2 > 128)
+            boundary_zone2 = mask_bin & (~eroded_bin2)
+            is_border = is_dark & boundary_zone2
+
+        if np.sum(is_border) < 20:
+            # 回退2：使用蒙版内全部深色像素（但提高阈值）
+            is_dark = np.any(base_arr[:, :, :3] < 120, axis=2)
+            is_border = is_dark & mask_bin
+            logger.info(f"CAD边框: 使用回退方案，边框像素={np.sum(is_border)}")
 
         if np.any(is_border):
+            # 边框线使用原CAD颜色（保持原汁原味）
             for c in range(3):
                 canvas_arr[:, :, c] = np.where(
                     is_border, base_arr[:, :, c], canvas_arr[:, :, c]
                 )
-            # 边框区域保持不透明
             canvas_arr[:, :, 3] = np.where(is_border, 255, canvas_arr[:, :, 3])
             logger.info(f"叠加CAD边框线: {np.sum(is_border)} 像素")
 
         return Image.fromarray(canvas_arr, mode="RGBA")
+
+    def _generate_concentric_borders(self, canvas: Image.Image,
+                                       outer_mask: Image.Image,
+                                       base_img: Image.Image,
+                                       config: ProcessConfig) -> Image.Image:
+        """生成多层同心细线边框（跟随EPS轮廓形状）
+
+        从外轮廓蒙版向内依次腐蚀，生成等比例缩放的细线边框。
+        所有边框线都严格跟随EPS轮廓的弧度和形状。
+
+        设计风格（与图二一致）：
+        - 细线条（1-2px），不是粗带
+        - 统一米黄色调，不渐深
+        - 3层细线：外层、中层、内层
+        """
+        w, h = canvas.size
+
+        # Get bounding rect from mask
+        mask_arr = np.array(outer_mask)
+        ys, xs = np.where(mask_arr > 128)
+        if len(xs) == 0:
+            return canvas
+
+        bx, by = int(xs.min()), int(ys.min())
+        bw, bh = int(xs.max() - bx + 1), int(ys.max() - by + 1)
+        min_dim = min(bw, bh)
+        if min_dim <= 0:
+            return canvas
+
+        # 边框线参数（细线风格）
+        # 线条宽度：1-2px（细、优雅）
+        line_width = max(1, int(min_dim * 0.003))
+        # 线条位置（距外轮廓的内缩距离）
+        line_insets = [
+            max(2, int(min_dim * 0.010)),   # 第1条细线：离外轮廓 ~1%
+            max(4, int(min_dim * 0.025)),   # 第2条细线：离外轮廓 ~2.5%
+            max(6, int(min_dim * 0.045)),   # 第3条细线：离外轮廓 ~4.5%
+        ]
+
+        # 统一米黄色边框（与设计风格一致）
+        border_color = (205, 188, 148)  # 米黄色
+
+        canvas_arr = np.array(canvas)
+
+        # 生成每条细线边框
+        for inset in line_insets:
+            # 腐蚀到该线条的位置
+            eroded_outer = self.contour_extractor.erode_mask(outer_mask, inset)
+            # 再腐蚀一个线条宽度作为内层边界
+            eroded_inner = self.contour_extractor.erode_mask(outer_mask, inset + line_width)
+
+            # 检查蒙版是否有效
+            eo_arr = np.array(eroded_outer)
+            ei_arr = np.array(eroded_inner)
+            if np.sum(eo_arr > 128) < 10 or np.sum(ei_arr > 128) < 10:
+                logger.info(f"边框线 inset={inset}px 蒙版过小，跳过")
+                break
+
+            # 生成细线环 = 外层腐蚀 - 内层腐蚀
+            thin_line = self.contour_extractor.create_border_ring_mask(
+                eroded_outer, eroded_inner
+            )
+
+            # 检查线环是否有效
+            tl_arr = np.array(thin_line)
+            if np.sum(tl_arr > 128) >= 1:
+                canvas_arr = self._apply_ring_to_canvas(
+                    canvas_arr, thin_line, border_color
+                )
+
+        logger.info(f"生成细线边框: {len(line_insets)}层, 颜色={border_color}")
+        return Image.fromarray(canvas_arr, mode="RGBA")
+
+    def _apply_ring_to_canvas(self, canvas_arr: np.ndarray,
+                               ring_mask: Image.Image,
+                               color: Tuple[int, int, int]) -> np.ndarray:
+        """将边框环应用到画布数组"""
+        mask_arr = np.array(ring_mask)
+        mask_bin = (mask_arr > 128)
+
+        if not np.any(mask_bin):
+            return canvas_arr
+
+        for c in range(3):
+            canvas_arr[:, :, c] = np.where(
+                mask_bin,
+                color[c],
+                canvas_arr[:, :, c]
+            )
+        canvas_arr[:, :, 3] = np.where(mask_bin, 255, canvas_arr[:, :, 3])
+
+        return canvas_arr
 
     def _compute_alignment(self, base_img: Image.Image, pattern_img: Image.Image,
                            config: ProcessConfig):

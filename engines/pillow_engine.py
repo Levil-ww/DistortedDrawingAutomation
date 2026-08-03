@@ -143,12 +143,37 @@ class PillowEngine(ImageEngine):
                 raise
             raise RuntimeError(f"无法打开EPS文件: {e}") from e
 
-    def load_psd_layers(self, path: Path) -> List[LayerInfo]:
-        """加载PSD图层
+    def _load_plain_image_as_composite(self, path: Path) -> List[LayerInfo]:
+        """将普通图片（JPG/PNG/BMP等）包装为PSD合成图层格式
 
-        支持矢量智能对象（SmartObjectLayer）和普通图层。
-        当psd-tools无法加载某些图层时，回退到使用PSD合成图。
+        直接加载整张图，包装为 __psd_composite__ 图层，
+        这样上层可以复用 _render_with_psd_composite 的渲染逻辑。
         """
+        try:
+            img = Image.open(str(path))
+            # 转为RGBA（如果是普通JPG则添加不透明alpha通道）
+            if img.mode != "RGBA":
+                img = img.convert("RGBA")
+            layers = [LayerInfo("__psd_composite__", img)]
+            logger.info(f"加载普通图片素材: {path.suffix} {img.width}x{img.height} (作为合成图层)")
+            return layers
+        except Exception as e:
+            raise RuntimeError(f"无法加载图片 {path}: {e}") from e
+
+    def load_psd_layers(self, path: Path) -> List[LayerInfo]:
+        """加载素材图层（智能识别格式）
+
+        - .psd: 使用 psd-tools 分图层加载，并附带完整合成图
+        - .jpg/.jpeg/.png/.bmp/.tif/.tiff/.webp 等普通图片: 直接包装为合成图层
+        """
+        suffix = path.suffix.lower()
+
+        # 非PSD格式走普通图片加载
+        psd_exts = {".psd", ".psb"}
+        if suffix not in psd_exts:
+            return self._load_plain_image_as_composite(path)
+
+        # PSD 格式按原逻辑分图层加载
         layers: List[LayerInfo] = []
         skipped_count = 0
         total_count = 0

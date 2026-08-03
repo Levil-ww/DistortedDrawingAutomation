@@ -9,6 +9,7 @@ GUI 界面层 - 仅负责用户交互和状态显示
 设计：GUI 只依赖 di_container 和 models，不直接依赖 engines/services
 """
 
+import logging
 import os
 import re
 import sys
@@ -28,6 +29,32 @@ from models import ProcessConfig
 from di_container import DIContainer
 
 
+class _GUILogHandler(logging.Handler):
+    """将 Python logging 重定向到 GUI 日志面板
+
+    用 root.after 切到主线程，避免跨线程更新 Tk 控件。
+    """
+
+    def __init__(self, root, log_func):
+        super().__init__(level=logging.INFO)
+        self._root = root
+        self._log_func = log_func
+
+    def emit(self, record: logging.LogRecord):
+        try:
+            msg = self.format(record)
+            # 简化格式：只显示消息体（级别/tag 交给 Python logging 基础格式）
+            # 去掉 "contour_extractor - " 等 logger name 前缀过长的问题
+            short = msg
+            # 有些日志已经自带换行，需要逐行推送
+            lines = short.split("\n")
+            for line in lines:
+                if line.strip():
+                    self._root.after(0, lambda l=line: self._log_func(l))
+        except Exception:
+            pass
+
+
 class DesignAutoGUI:
     """设计自动化图形界面"""
 
@@ -43,6 +70,7 @@ class DesignAutoGUI:
 
         self._build_ui()
         self._load_defaults()
+        self._setup_log_bridge()
 
     # ---------- UI 构建 ----------
 
@@ -134,7 +162,7 @@ class DesignAutoGUI:
 
         for label, var_name, cmd in [
             ("EPS模板:", "eps_var", self._browse_eps),
-            ("PSD素材:", "psd_var", self._browse_psd),
+            ("素材文件:", "psd_var", self._browse_material),
             ("输出路径:", "out_var", self._browse_out),
         ]:
             row = Frame(sec, bg="#f5f5f5")
@@ -320,34 +348,43 @@ class DesignAutoGUI:
         except Exception as e:
             self._log(f"检测EPS尺寸失败: {e}")
 
-    def _browse_psd(self):
-        p = filedialog.askopenfilename(title="选择PSD素材", filetypes=[("PSD", "*.psd"), ("所有文件", "*.*")])
+    def _browse_material(self):
+        p = filedialog.askopenfilename(
+            title="选择素材文件",
+            filetypes=[
+                ("素材文件", "*.psd;*.jpg;*.jpeg;*.png;*.bmp;*.tif;*.tiff;*.webp"),
+                ("PSD 素材", "*.psd"),
+                ("图片素材", "*.jpg;*.jpeg;*.png;*.bmp;*.tif;*.tiff;*.webp"),
+                ("所有文件", "*.*"),
+            ]
+        )
         if p:
             self.psd_var.set(p)
-            self._auto_detect_psd_size(p)
+            self._auto_detect_material_size(p)
 
-    def _auto_detect_psd_size(self, psd_path: str):
-        """加载PSD时检测素材尺寸，仅用于方向校验，不覆盖EPS画布尺寸"""
+    def _auto_detect_material_size(self, material_path: str):
+        """加载素材时检测尺寸，仅用于方向校验，不覆盖EPS画布尺寸"""
         try:
             sys.path.insert(0, str(self.work_dir))
             from services.design_service import _parse_psd_size_from_filename
             from engines.pillow_engine import get_eps_bbox
             from pathlib import Path
 
-            size = _parse_psd_size_from_filename(Path(psd_path))
+            size = _parse_psd_size_from_filename(Path(material_path))
             if size:
                 w, h = size
                 orientation = "横版" if w > h else "竖版"
                 # 从文件名检测是否有方向标注
-                psd_name = Path(psd_path).stem
+                mat_name = Path(material_path).stem
                 has_direction_hint = bool(re.search(
                     r'竖版|纵向|portrait|横版|横向|landscape',
-                    psd_name, re.IGNORECASE
+                    mat_name, re.IGNORECASE
                 ))
+                ext = Path(material_path).suffix.upper()
                 if has_direction_hint:
-                    self._log(f"检测到PSD素材尺寸: {w:.0f}x{h:.0f}cm ({orientation}, 按文件名方向标注)")
+                    self._log(f"检测到素材尺寸({ext}): {w:.0f}x{h:.0f}cm ({orientation}, 按文件名方向标注)")
                 else:
-                    self._log(f"检测到PSD素材尺寸: {w:.0f}x{h:.0f}cm ({orientation}, 默认较长边为宽)")
+                    self._log(f"检测到素材尺寸({ext}): {w:.0f}x{h:.0f}cm ({orientation}, 默认较长边为宽)")
 
                 # 检查与EPS的方向是否一致
                 eps_path = self.eps_var.get()
@@ -355,18 +392,19 @@ class DesignAutoGUI:
                     bbox = get_eps_bbox(Path(eps_path))
                     if bbox:
                         eps_w, eps_h = bbox
-                        psd_landscape = w > h
+                        mat_landscape = w > h
                         eps_landscape = eps_w > eps_h
-                        if psd_landscape != eps_landscape:
-                            self._log(f"注意: PSD方向({orientation})与EPS"
+                        if mat_landscape != eps_landscape:
+                            self._log(f"注意: 素材方向({orientation})与EPS"
                                       f"({'横版' if eps_landscape else '竖版'})不一致，"
                                       f"处理时会自动调整匹配")
                         else:
-                            self._log(f"PSD方向({orientation})与EPS一致，无需调整")
+                            self._log(f"素材方向({orientation})与EPS一致，无需调整")
             else:
-                self._log("PSD文件名未包含尺寸信息")
+                ext = Path(material_path).suffix.upper()
+                self._log(f"{ext}素材文件名未包含尺寸信息（使用自动缩放适配）")
         except Exception as e:
-            self._log(f"检测PSD尺寸失败: {e}")
+            self._log(f"检测素材尺寸失败: {e}")
 
     def _browse_out(self):
         p = filedialog.asksaveasfilename(title="输出路径", defaultextension=".jpg",
@@ -376,12 +414,19 @@ class DesignAutoGUI:
 
     def _load_defaults(self):
         eps = list(self.work_dir.glob("*.eps"))
+        # 优先查找PSD，其次查找JPG/PNG等常见图片格式
         psd = list(self.work_dir.glob("*.psd"))
+        if not psd:
+            for ext in ["*.jpg", "*.jpeg", "*.png", "*.bmp", "*.tif", "*.tiff", "*.webp"]:
+                psd = list(self.work_dir.glob(ext))
+                if psd:
+                    break
         if eps:
             self.eps_var.set(str(eps[0]))
             self._auto_detect_eps_size(str(eps[0]))
         if psd:
             self.psd_var.set(str(psd[0]))
+            self._auto_detect_material_size(str(psd[0]))
 
     def _collect_config(self) -> ProcessConfig:
         return ProcessConfig(
@@ -413,6 +458,29 @@ class DesignAutoGUI:
         self.log_text.see("end")
         self.log_text.update_idletasks()
 
+    def _setup_log_bridge(self):
+        """桥接 Python logging → GUI 日志面板
+
+        将所有 logger.info/warning/error 自动转发到 GUI 日志文本框，
+        方便用户在 GUI 中直接查看轮廓提取、蒙版选择等诊断信息。
+        """
+        # 清理已有的 handlers（避免重复添加）
+        root_logger = logging.getLogger()
+        for h in root_logger.handlers[:]:
+            if isinstance(h, _GUILogHandler):
+                root_logger.removeHandler(h)
+
+        handler = _GUILogHandler(self.root, self._log)
+        formatter = logging.Formatter("%(levelname)s [%(name)s] %(message)s")
+        handler.setFormatter(formatter)
+        # 显示 INFO 及以上级别
+        handler.setLevel(logging.INFO)
+
+        root_logger.addHandler(handler)
+        # 设置全局最低级别为 DEBUG（handler 会自己过滤）
+        root_logger.setLevel(logging.DEBUG)
+        self._log("[日志] 已连接 Python logging → GUI 面板")
+
     def _on_preview(self):
         self.status_var.set("生成预览中...")
         self._log("开始生成预览...")
@@ -424,7 +492,14 @@ class DesignAutoGUI:
                 if not cfg.eps_file or not Path(cfg.eps_file).exists():
                     raise RuntimeError(f"EPS文件不存在: {cfg.eps_file}")
                 if not cfg.psd_file or not Path(cfg.psd_file).exists():
-                    raise RuntimeError(f"PSD文件不存在: {cfg.psd_file}")
+                    raise RuntimeError(f"素材文件不存在: {cfg.psd_file}")
+                mat_ext = Path(cfg.psd_file).suffix.lower()
+                support_exts = {".psd", ".psb", ".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+                if mat_ext not in support_exts:
+                    raise RuntimeError(
+                        f"不支持的素材格式: {mat_ext}。"
+                        f"支持 PSD / JPG / PNG / BMP / TIF / WEBP 等格式"
+                    )
 
                 engine = self._container.register_engine("auto")
                 self.engine_var.set(f"引擎: {engine.capabilities.name}")
@@ -435,6 +510,7 @@ class DesignAutoGUI:
                 eps_size = service._resolve_canvas_size(Path(cfg.eps_file), cfg)
                 eps_w_cm, eps_h_cm = eps_size
                 self._log(f"画布尺寸: {eps_w_cm:.1f} x {eps_h_cm:.1f} cm")
+                self._log("调用 DesignService.generate_preview() ...")
 
                 # 生成预览（使用20cm最大显示宽度）
                 img = service.generate_preview(cfg, max_width_cm=15.0)
@@ -487,7 +563,7 @@ class DesignAutoGUI:
 
     def _on_process(self):
         if not self.eps_var.get() or not self.psd_var.get():
-            messagebox.showwarning("提示", "请先选择EPS模板和PSD素材")
+            messagebox.showwarning("提示", "请先选择EPS模板和素材文件 (PSD/JPG/PNG等)")
             return
 
         self.status_var.set("处理中...")

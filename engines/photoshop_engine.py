@@ -78,7 +78,25 @@ class PhotoshopEngine(ImageEngine):
         self._ps_app.doJavaScript(js)
         return self._active_doc_to_pil()
 
+    def _load_plain_image_as_composite(self, path: Path) -> List[LayerInfo]:
+        """将普通图片（JPG/PNG/BMP等）包装为PSD合成图层格式"""
+        try:
+            img = Image.open(str(path))
+            if img.mode != "RGBA":
+                img = img.convert("RGBA")
+            layers = [LayerInfo("__psd_composite__", img)]
+            logger.info(f"加载普通图片素材 (PS引擎): {path.suffix} {img.width}x{img.height}")
+            return layers
+        except Exception as e:
+            raise RuntimeError(f"无法加载图片 {path}: {e}") from e
+
     def load_psd_layers(self, path: Path) -> List[LayerInfo]:
+        suffix = path.suffix.lower()
+        psd_exts = {".psd", ".psb"}
+        if suffix not in psd_exts:
+            # 非PSD格式，直接用Pillow加载为合成图层（无需启动PS）
+            return self._load_plain_image_as_composite(path)
+
         doc = self._ps_app.Open(str(path))
         layers: List[LayerInfo] = []
         try:

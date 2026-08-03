@@ -36,7 +36,7 @@ class ProcessConfig:
     """处理配置数据类 - 所有默认值集中在此定义"""
     # 文件路径
     eps_file: str = ""
-    psd_file: str = ""
+    psd_file: str = ""   # 素材文件：支持 .psd / .jpg / .jpeg / .png / .bmp 等格式
     output_file: str = "output.jpg"
 
     # 基础参数
